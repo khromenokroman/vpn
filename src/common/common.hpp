@@ -1,6 +1,7 @@
 #pragma once
 
 #include <fcntl.h>
+#include <fmt/format.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 #include <signal.h>
@@ -20,6 +21,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility> // for std::exchange
 #include <vector>
@@ -31,7 +33,6 @@
 #include <net/if.h>
 
 #define BUFFER_SIZE 65536
-#define VPN_PORT 51820
 #define VPN_MTU 1500
 #define TUN_DEVICE "/dev/net/tun"
 
@@ -44,7 +45,7 @@ inline void initSyslog(const char* ident) { openlog(ident, LOG_PID, LOG_DAEMON);
 inline void closeSyslog() { closelog(); }
 
 // Создание TUN устройства
-int createTunDevice(const std::string& name = "tun0", const std::string& ip = "192.168.200.2") {
+int createTunDevice(std::string_view name, std::string_view ip) {
     struct ifreq ifr;
     int fd;
 
@@ -56,7 +57,7 @@ int createTunDevice(const std::string& name = "tun0", const std::string& ip = "1
     memset(&ifr, 0, sizeof(ifr));
     ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
 
-    strncpy(ifr.ifr_name, name.c_str(), IFNAMSIZ);
+    strncpy(ifr.ifr_name, name.data(), IFNAMSIZ);
 
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
         syslog(LOG_ERR, "ioctl TUNSETIFF failed: %s", strerror(errno));
@@ -64,17 +65,10 @@ int createTunDevice(const std::string& name = "tun0", const std::string& ip = "1
         return -1;
     }
 
-    // Настройка IP адреса
-    std::string cmd = "ip addr add " + ip + "/24 dev " + name + " 2>/dev/null";
-    system(cmd.c_str());
-
-    cmd = "ip link set " + name + " up 2>/dev/null";
-    system(cmd.c_str());
-
-    // Включаем IP forwarding
+    system(::fmt::format("ip addr add {}/24 dev {}", ip, name).c_str());
+    system(::fmt::format("ip link set {} up 2>/dev/null", name).c_str());
     system("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null");
-
-    syslog(LOG_INFO, "TUN device %s created with IP %s", name.c_str(), ip.c_str());
+    syslog(LOG_INFO, "TUN device %s created with IP %s", name.data(), ip.data());
     return fd;
 }
 
@@ -90,33 +84,17 @@ void setupClientRoutes(const std::string& tun_name = "tun0") {
     }
 }
 
-// Настройка маршрутов на сервере
-void setupServerRoutes(const std::string& tun_name = "tun0") {
-    std::string cmd;
-    cmd = "iptables -t nat -D POSTROUTING -s 192.168.200.0/24 -o ens3 -j MASQUERADE 2>/dev/null";
-    system(cmd.c_str());
-    cmd = "iptables -D FORWARD -i " + tun_name + " -o ens3 -j ACCEPT 2>/dev/null";
-    system(cmd.c_str());
-    cmd = "iptables -D FORWARD -i ens3 -o " + tun_name + " -j ACCEPT 2>/dev/null";
-    system(cmd.c_str());
-
-    cmd = "iptables -t nat -A POSTROUTING -s 192.168.200.0/24 -o ens3 -j MASQUERADE";
-    if (system(cmd.c_str()) != 0) {
-        syslog(LOG_ERR, "Failed to add NAT rule");
-        return;
-    }
-
-    cmd = "iptables -A FORWARD -i " + tun_name + " -o ens3 -j ACCEPT";
-    system(cmd.c_str());
-
-    cmd = "iptables -A FORWARD -i ens3 -o " + tun_name + " -j ACCEPT";
-    system(cmd.c_str());
-
-    system("iptables -I INPUT 1 -p udp --dport 51820 -j ACCEPT");
-
-    system("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null");
-
-    syslog(LOG_INFO, "NAT and forwarding rules configured for %s", tun_name.c_str());
+void setupServerRoutes(std::string_view tun_name, std::string_view external_iface, std::size_t vpn_port) {
+    system(::fmt::format("iptables -t nat -D POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
+    system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
+    system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
+    system(::fmt::format("iptables -D INPUT -p udp --dport {} -j ACCEPT", vpn_port).c_str());
+    system(::fmt::format("iptables -t nat -A POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
+    system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
+    system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
+    system(::fmt::format("iptables -I INPUT 1 -p udp --dport {} -j ACCEPT", vpn_port).c_str());
+    system("echo 1 > /proc/sys/net/ipv4/ip_forward");
+    syslog(LOG_INFO, "NAT and forwarding rules configured for %s through %s on UDP port %lu", tun_name.data(), external_iface.data(), vpn_port);
 }
 
 // Получение имени внешнего интерфейса
@@ -146,37 +124,37 @@ std::string getDefaultGateway() {
     pclose(fp);
     return "";
 }
-// Класс для работы с TUN устройством (только открытие/закрытие/запись)
+
 class TunDevice {
-   private:
-    int fd;
-
    public:
-    TunDevice() : fd(-1) {}
+    explicit TunDevice() : m_fd(-1) {}
 
-    bool open(const std::string& name = "tun0", const std::string& ip = "192.168.200.2") {
-        fd = createTunDevice(name, ip);
-        if (fd < 0) return false;
+    bool open(std::string_view name, std::string_view ip) {
+        m_fd = createTunDevice(name, ip);
+        if (m_fd < 0) return false;
         return true;
     }
 
     void close() {
-        if (fd >= 0) {
-            ::close(fd);
-            fd = -1;
+        if (m_fd >= 0) {
+            ::close(m_fd);
+            m_fd = -1;
         }
     }
 
-    int getFd() const { return fd; }
-    bool isOpen() const { return fd >= 0; }
+    int getFd() const { return m_fd; }
+    bool isOpen() const { return m_fd >= 0; }
 
     bool write(const char* data, size_t length) {
-        if (fd < 0) return false;
-        ssize_t written = ::write(fd, data, length);
+        if (m_fd < 0) return false;
+        ssize_t written = ::write(m_fd, data, length);
         if (written < 0) {
             syslog(LOG_ERR, "TUN write failed: %s", strerror(errno));
             return false;
         }
         return written == static_cast<ssize_t>(length);
     }
+
+   private:
+    int m_fd;
 };
