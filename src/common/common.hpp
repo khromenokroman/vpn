@@ -100,22 +100,6 @@ void setupServerRoutes(std::string_view tun_name, std::string_view external_ifac
     syslog(LOG_INFO, "Правила NAT и forwarding настроены для %s через %s на UDP-порту %lu", tun_name.data(), external_iface.data(), vpn_port);
 }
 
-// Получение имени внешнего интерфейса
-std::string getDefaultInterface() {
-    FILE* fp = popen("ip route | grep default | awk '{print $5}'", "r");
-    if (!fp) return "ens3";
-
-    char buffer[256];
-    if (fgets(buffer, sizeof(buffer), fp) != NULL) {
-        buffer[strcspn(buffer, "\n")] = 0;
-        pclose(fp);
-        return std::string(buffer);
-    }
-
-    pclose(fp);
-    return "ens3";
-}
-
 std::string getDefaultGateway() {
     FILE* fp = popen("ip route | grep default | awk '{print $3}'", "r");
     if (!fp) return "";
