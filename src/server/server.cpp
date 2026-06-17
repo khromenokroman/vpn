@@ -18,12 +18,11 @@ class VPNServer {
 
     std::thread io_thread;
     std::thread tun_thread;
-    std::string m_external_iface;
+    std::string m_external_iface{"ens3"};
 
    public:
     VPNServer(std::string_view tun_name, std::string_view tun_ip, std::size_t port)
         : io_context(), udp_socket(io_context, udp::endpoint(udp::v4(), port)), running(true), m_tun_name{tun_name}, m_tun_ip{tun_ip}, m_port{port} {
-        m_external_iface = getDefaultInterface();
         tun_device = std::make_unique<TunDevice>();
     }
 
@@ -141,7 +140,8 @@ class VPNServer {
         if (strncmp(src_ip, "192.168.200.", 12) == 0) {
             std::string client_ip(src_ip);
             if (clients.find(client_ip) == clients.end()) {
-                syslog(LOG_INFO, "Подключён новый клиент: %s с адреса %s:%d", client_ip.c_str(), endpoint.address().to_string().c_str(), endpoint.port());
+                syslog(LOG_INFO, "Подключён новый клиент: %s с адреса %s:%d", client_ip.c_str(), endpoint.address().to_string().c_str(),
+                       endpoint.port());
             }
             clients[client_ip] = endpoint;
             client_last_seen[client_ip] = std::chrono::steady_clock::now();
