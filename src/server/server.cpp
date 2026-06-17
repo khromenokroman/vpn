@@ -1,44 +1,47 @@
-#include "../common/common.hpp"
 #include <boost/asio.hpp>
 
+#include "../common/common.hpp"
+
 class VPNServer {
-private:
+   private:
     boost::asio::io_context io_context;
     udp::socket udp_socket;
     udp::endpoint remote_endpoint;
     std::unique_ptr<TunDevice> tun_device;
     std::atomic<bool> running;
-
+    std::string m_tun_name;
+    std::string m_tun_ip;
+    std::size_t m_port;
     std::map<std::string, udp::endpoint> clients;
     std::map<std::string, std::chrono::steady_clock::time_point> client_last_seen;
     std::array<char, BUFFER_SIZE> udp_buffer;
 
     std::thread io_thread;
     std::thread tun_thread;
-    std::string external_iface;
+    std::string m_external_iface;
 
-public:
-    VPNServer()
-        : io_context(),
-          udp_socket(io_context, udp::endpoint(udp::v4(), VPN_PORT)),
-          running(true) {
-        // initSyslog("vpn-server");
-        external_iface = getDefaultInterface();
+   public:
+    VPNServer(std::string_view tun_name, std::string_view tun_ip, std::size_t port)
+        : io_context(), udp_socket(io_context, udp::endpoint(udp::v4(), port)), running(true), m_tun_name{tun_name}, m_tun_ip{tun_ip}, m_port{port} {
+        m_external_iface = getDefaultInterface();
         tun_device = std::make_unique<TunDevice>();
     }
 
-    ~VPNServer() { stop(); closeSyslog(); }
+    ~VPNServer() {
+        stop();
+        closeSyslog();
+    }
 
     bool init() {
-        if (!tun_device->open("tun0", "192.168.200.1")) {
+        if (!tun_device->open(m_tun_name, m_tun_ip)) {
             syslog(LOG_ERR, "Failed to create TUN device");
             return false;
         }
-        setupServerRoutes();
+        setupServerRoutes(m_tun_name, m_external_iface, m_port);
         char hostname[256];
         gethostname(hostname, sizeof(hostname));
-        syslog(LOG_INFO, "VPN Server initialized on port %d", VPN_PORT);
-        syslog(LOG_INFO, "Hostname: %s, Interface: %s", hostname, external_iface.c_str());
+        syslog(LOG_INFO, "VPN Server initialized on port %zu", m_port);
+        syslog(LOG_INFO, "Hostname: %s, Interface: %s", hostname, m_external_iface.c_str());
         return true;
     }
 
@@ -61,16 +64,14 @@ public:
         syslog(LOG_INFO, "VPN Server stopped");
     }
 
-private:
+   private:
     void tunReadLoop() {
         char buffer[BUFFER_SIZE];
         while (running) {
             int n = read(tun_device->getFd(), buffer, BUFFER_SIZE);
             if (n > 0) {
                 std::vector<char> data(buffer, buffer + n);
-                boost::asio::post(io_context, [this, data]() {
-                    this->onTunData(data.data(), data.size());
-                });
+                boost::asio::post(io_context, [this, data]() { this->onTunData(data.data(), data.size()); });
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
                 if (running) syslog(LOG_ERR, "TUN read error: %s", strerror(errno));
                 break;
@@ -81,27 +82,21 @@ private:
 
     void startUdpRead() {
         if (!running) return;
-        udp_socket.async_receive_from(
-            boost::asio::buffer(udp_buffer),
-            remote_endpoint,
-            [this](const boost::system::error_code& ec, size_t bytes) {
-                if (ec) {
-                    if (ec != boost::asio::error::operation_aborted)
-                        syslog(LOG_ERR, "UDP receive error: %s", ec.message().c_str());
-                    return;
-                }
-                if (bytes > 0) {
-                    syslog(LOG_ERR, "UDP receive bytes: %lu", bytes);
-                    this->onUdpData(udp_buffer.data(), bytes, remote_endpoint);
-                }
-                if (running) startUdpRead();
+        udp_socket.async_receive_from(boost::asio::buffer(udp_buffer), remote_endpoint, [this](const boost::system::error_code& ec, size_t bytes) {
+            if (ec) {
+                if (ec != boost::asio::error::operation_aborted) syslog(LOG_ERR, "UDP receive error: %s", ec.message().c_str());
+                return;
             }
-        );
+            if (bytes > 0) {
+                syslog(LOG_ERR, "UDP receive bytes: %lu", bytes);
+                this->onUdpData(udp_buffer.data(), bytes, remote_endpoint);
+            }
+            if (running) startUdpRead();
+        });
     }
 
     void startCleanupTimer() {
-        auto timer = std::make_shared<boost::asio::steady_timer>(
-            io_context, std::chrono::seconds(10));
+        auto timer = std::make_shared<boost::asio::steady_timer>(io_context, std::chrono::seconds(10));
         timer->async_wait([this, timer](const boost::system::error_code& ec) {
             if (ec) return;
             this->cleanupClients();
@@ -146,10 +141,7 @@ private:
         if (strncmp(src_ip, "192.168.200.", 12) == 0) {
             std::string client_ip(src_ip);
             if (clients.find(client_ip) == clients.end()) {
-                syslog(LOG_INFO, "New client connected: %s from %s:%d",
-                       client_ip.c_str(),
-                       endpoint.address().to_string().c_str(),
-                       endpoint.port());
+                syslog(LOG_INFO, "New client connected: %s from %s:%d", client_ip.c_str(), endpoint.address().to_string().c_str(), endpoint.port());
             }
             clients[client_ip] = endpoint;
             client_last_seen[client_ip] = std::chrono::steady_clock::now();
@@ -182,27 +174,26 @@ private:
 
 int main(int argc, char* argv[]) {
     initSyslog("vpn-server");
-    signal(SIGINT, [](int) { syslog(LOG_INFO, "Received SIGINT"); exit(0); });
-    signal(SIGTERM, [](int) { syslog(LOG_INFO, "Received SIGTERM"); exit(0); });
+    signal(SIGINT, [](int) {
+        syslog(LOG_INFO, "Received SIGINT");
+        EXIT_SUCCESS;
+    });
+    signal(SIGTERM, [](int) {
+        syslog(LOG_INFO, "Received SIGTERM");
+        EXIT_SUCCESS;
+    });
 
     if (geteuid() != 0) {
         syslog(LOG_ERR, "Must be run as root");
-        closelog();
-        return 1;
+        EXIT_FAILURE;
     }
-
-    int port = VPN_PORT;
-    if (argc > 1) {
-        port = atoi(argv[1]);
-        if (port <= 0 || port > 65535) {
-            syslog(LOG_ERR, "Invalid port: %s", argv[1]);
-            closelog();
-            return 1;
-        }
+    std::size_t port = atoll(argv[1]);
+    if (port <= 0 || port > 65535) {
+        syslog(LOG_ERR, "Invalid port: %s", argv[1]);
+        EXIT_FAILURE;
     }
-
-    syslog(LOG_INFO, "Starting VPN Server on port %d", port);
-    VPNServer server;
+    syslog(LOG_INFO, "Starting VPN Server on port %zu", port);
+    VPNServer server("tun0", "192.168.200.1", port);
     if (!server.init()) {
         syslog(LOG_ERR, "Failed to initialize server");
         closelog();
