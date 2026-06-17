@@ -21,7 +21,6 @@ class VPNClient {
 
    public:
     VPNClient(const std::string& server_ip_, int port) : udp_socket(io_context), running(true), server_ip(server_ip_), server_port(port) {
-        // initSyslog("vpn-client");
         tun_device = std::make_unique<TunDevice>();
     }
 
@@ -32,45 +31,27 @@ class VPNClient {
 
     bool init() {
         if (!tun_device->open("tun0", "192.168.200.2")) {
-            syslog(LOG_ERR, "Failed to create TUN device");
+            syslog(LOG_ERR, "Не удалось создать TUN-устройство");
             return false;
         }
-        // Устанавливаем маршруты (пока не добавляем default, а только добавляем маршрут к серверу через реальный интерфейс)
-        // Но сначала нам нужно получить шлюз и интерфейс по умолчанию.
-        std::string iface = getDefaultInterface();
-        std::string gateway = getDefaultGateway();
-        if (!gateway.empty() && !iface.empty()) {
-            std::string cmd = "ip route add " + server_ip + " via " + gateway + " dev " + iface + " 2>/dev/null";
-            system(cmd.c_str());
-        }
-        // Теперь добавляем default через tun0
-        setupClientRoutes(); // это добавляет default через tun0
+        setupClientRoutes();
 
         boost::system::error_code ec;
         auto ep = udp::endpoint(boost::asio::ip::address::from_string(server_ip, ec), server_port);
         if (ec) {
-            syslog(LOG_ERR, "Invalid server IP: %s", server_ip.c_str());
+            syslog(LOG_ERR, "Недопустимый IP-адрес сервера: %s", server_ip.c_str());
             return false;
         }
         server_endpoint = ep;
 
         udp_socket.open(udp::v4());
 
-        // Привязываем сокет к интерфейсу по умолчанию, чтобы пакеты не уходили в туннель
-        if (!iface.empty()) {
-            if (setsockopt(udp_socket.native_handle(), SOL_SOCKET, SO_BINDTODEVICE, iface.c_str(), iface.length()) < 0) {
-                syslog(LOG_WARNING, "Failed to bind UDP socket to interface %s: %s", iface.c_str(), strerror(errno));
-            } else {
-                syslog(LOG_INFO, "UDP socket bound to interface %s", iface.c_str());
-            }
-        }
-
-        syslog(LOG_INFO, "VPN Client initialized, server: %s:%d", server_ip.c_str(), server_port);
+        syslog(LOG_INFO, "VPN-клиент инициализирован, сервер: %s:%d", server_ip.c_str(), server_port);
         return true;
     }
 
     void run() {
-        syslog(LOG_INFO, "VPN Client starting...");
+        syslog(LOG_INFO, "Запуск VPN-клиента...");
         last_keepalive = std::chrono::steady_clock::now();
 
         tun_thread = std::thread([this]() { tunReadLoop(); });
@@ -79,7 +60,7 @@ class VPNClient {
         startStatsTimer();
 
         io_thread = std::thread([this]() { io_context.run(); });
-        syslog(LOG_INFO, "VPN Client running");
+        syslog(LOG_INFO, "VPN-клиент запущен");
     }
 
     void stop() {
@@ -89,7 +70,7 @@ class VPNClient {
         if (tun_thread.joinable()) tun_thread.join();
         udp_socket.close();
         tun_device->close();
-        syslog(LOG_INFO, "VPN Client stopped");
+        syslog(LOG_INFO, "VPN-клиент остановлен");
     }
 
    private:
@@ -100,9 +81,9 @@ class VPNClient {
             if (n > 0) {
                 std::vector<char> data(buffer, buffer + n);
                 boost::asio::post(io_context, [this, data]() { this->onTunData(data.data(), data.size()); });
-                syslog(LOG_DEBUG, "TUN read bytes: %d", n);
+                syslog(LOG_DEBUG, "Прочитано из TUN байт: %d", n);
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                if (running) syslog(LOG_ERR, "TUN read error: %s", strerror(errno));
+                if (running) syslog(LOG_ERR, "Ошибка чтения из TUN: %s", strerror(errno));
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -113,7 +94,7 @@ class VPNClient {
         if (!running) return;
         udp_socket.async_receive(boost::asio::buffer(udp_buffer), [this](const boost::system::error_code& ec, size_t bytes) {
             if (ec) {
-                if (ec != boost::asio::error::operation_aborted) syslog(LOG_ERR, "UDP receive error: %s", ec.message().c_str());
+                if (ec != boost::asio::error::operation_aborted) syslog(LOG_ERR, "Ошибка приёма UDP-пакета: %s", ec.message().c_str());
                 return;
             }
             if (bytes > 0) {
@@ -170,12 +151,12 @@ class VPNClient {
             try {
                 auto sent_bytes = udp_socket.send_to(boost::asio::buffer(data, length), server_endpoint);
                 packets_sent++;
-                syslog(LOG_DEBUG, "Sent %zu bytes to server", sent_bytes);
+                syslog(LOG_DEBUG, "Отправлено серверу байт: %zu", sent_bytes);
             } catch (const std::exception& e) {
-                syslog(LOG_ERR, "Failed to send to server: %s", e.what());
+                syslog(LOG_ERR, "Не удалось отправить пакет серверу: %s", e.what());
             }
         } else {
-            syslog(LOG_DEBUG, "Dropped packet to local tunnel address: %s", dest_ip);
+            syslog(LOG_DEBUG, "Отброшен пакет на локальный туннельный адрес: %s", dest_ip);
         }
     }
 
@@ -183,7 +164,7 @@ class VPNClient {
         if (length > 0) {
             tun_device->write(data, length);
             packets_received++;
-            syslog(LOG_DEBUG, "Received %zu bytes from server", length);
+            syslog(LOG_DEBUG, "Получено от сервера байт: %zu", length);
         }
     }
 
@@ -192,56 +173,56 @@ class VPNClient {
             udp_socket.send_to(boost::asio::buffer("", 0), server_endpoint);
             last_keepalive = std::chrono::steady_clock::now();
         } catch (const std::exception& e) {
-            syslog(LOG_ERR, "Keep-alive failed: %s", e.what());
+            syslog(LOG_ERR, "Ошибка отправки keep-alive: %s", e.what());
         }
     }
 
-    void printStats() { syslog(LOG_INFO, "Stats: sent=%d, received=%d", packets_sent, packets_received); }
+    void printStats() { syslog(LOG_INFO, "Статистика: отправлено=%d, получено=%d", packets_sent, packets_received); }
 };
 
 int main(int argc, char* argv[]) {
-    initSyslog("vpn-client-main", LOG_DEBUG);
+    initSyslog("vpn-client", LOG_INFO);
     signal(SIGINT, [](int) {
-        syslog(LOG_INFO, "Received SIGINT");
-        exit(0);
+        syslog(LOG_INFO, "Получен сигнал SIGINT");
+        exit(EXIT_SUCCESS);
     });
     signal(SIGTERM, [](int) {
-        syslog(LOG_INFO, "Received SIGTERM");
-        exit(0);
+        syslog(LOG_INFO, "Получен сигнал SIGTERM");
+        exit(EXIT_SUCCESS);
     });
 
     if (geteuid() != 0) {
-        syslog(LOG_ERR, "Must be run as root");
+        syslog(LOG_ERR, "Клиент должен быть запущен от имени root");
         closelog();
-        return 1;
+        return EXIT_FAILURE;
     }
 
     if (argc < 2) {
-        syslog(LOG_ERR, "Usage: %s <server_ip> [port]", argv[0]);
+        syslog(LOG_ERR, "Не указан IP-адрес сервера. Использование: %s <server_ip> [port]", argv[0]);
         closelog();
-        return 1;
+        return EXIT_FAILURE;
     }
 
     std::string server_ip = argv[1];
     int port;
     port = atoi(argv[2]);
     if (port <= 0 || port > 65535) {
-        syslog(LOG_ERR, "Invalid port: %s", argv[2]);
+        syslog(LOG_ERR, "Недопустимый порт: %s", argv[2]);
         closelog();
-        return 1;
+        return EXIT_FAILURE;
     }
 
-    syslog(LOG_INFO, "Starting VPN Client connecting to %s:%d", server_ip.c_str(), port);
+    syslog(LOG_INFO, "Запуск VPN-клиента, подключение к %s:%d", server_ip.c_str(), port);
 
     VPNClient client(server_ip, port);
     if (!client.init()) {
-        syslog(LOG_ERR, "Failed to initialize client");
+        syslog(LOG_ERR, "Не удалось инициализировать клиент");
         closelog();
-        return 1;
+        return EXIT_FAILURE;
     }
 
     client.run();
     while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
     closeSyslog();
-    return 0;
+    return EXIT_SUCCESS;
 }
