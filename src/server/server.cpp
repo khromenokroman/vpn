@@ -173,7 +173,7 @@ class VPNServer {
 };
 
 int main(int argc, char* argv[]) {
-    initSyslog("vpn-server");
+    initSyslog("vpn-server", LOG_INFO);
     signal(SIGINT, [](int) {
         syslog(LOG_INFO, "Получен сигнал SIGINT");
         exit(EXIT_SUCCESS);

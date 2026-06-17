@@ -39,7 +39,10 @@
 using boost::asio::ip::udp;
 
 // Инициализация syslog
-inline void initSyslog(const char* ident) { openlog(ident, LOG_PID, LOG_DAEMON); }
+inline void initSyslog(const char* ident, int log_level) {
+    openlog(ident, LOG_PID, LOG_DAEMON);
+    setlogmask(LOG_UPTO(log_level));
+}
 
 // Закрытие syslog
 inline void closeSyslog() { closelog(); }

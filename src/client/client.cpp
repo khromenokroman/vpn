@@ -200,7 +200,7 @@ class VPNClient {
 };
 
 int main(int argc, char* argv[]) {
-    initSyslog("vpn-client-main");
+    initSyslog("vpn-client-main", LOG_DEBUG);
     signal(SIGINT, [](int) {
         syslog(LOG_INFO, "Received SIGINT");
         exit(0);
