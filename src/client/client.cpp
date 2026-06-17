@@ -20,7 +20,7 @@ class VPNClient {
     int packets_sent = 0, packets_received = 0;
 
    public:
-    VPNClient(const std::string& server_ip_, int port = VPN_PORT) : udp_socket(io_context), running(true), server_ip(server_ip_), server_port(port) {
+    VPNClient(const std::string& server_ip_, int port) : udp_socket(io_context), running(true), server_ip(server_ip_), server_port(port) {
         // initSyslog("vpn-client");
         tun_device = std::make_unique<TunDevice>();
     }
@@ -223,14 +223,12 @@ int main(int argc, char* argv[]) {
     }
 
     std::string server_ip = argv[1];
-    int port = VPN_PORT;
-    if (argc > 2) {
-        port = atoi(argv[2]);
-        if (port <= 0 || port > 65535) {
-            syslog(LOG_ERR, "Invalid port: %s", argv[2]);
-            closelog();
-            return 1;
-        }
+    int port;
+    port = atoi(argv[2]);
+    if (port <= 0 || port > 65535) {
+        syslog(LOG_ERR, "Invalid port: %s", argv[2]);
+        closelog();
+        return 1;
     }
 
     syslog(LOG_INFO, "Starting VPN Client connecting to %s:%d", server_ip.c_str(), port);
