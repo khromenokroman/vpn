@@ -50,7 +50,7 @@ int createTunDevice(std::string_view name, std::string_view ip) {
     int fd;
 
     if ((fd = open(TUN_DEVICE, O_RDWR)) < 0) {
-        syslog(LOG_ERR, "Cannot open TUN device: %s", strerror(errno));
+        syslog(LOG_ERR, "Не удалось открыть TUN-устройство: %s", strerror(errno));
         return -1;
     }
 
@@ -60,7 +60,7 @@ int createTunDevice(std::string_view name, std::string_view ip) {
     strncpy(ifr.ifr_name, name.data(), IFNAMSIZ);
 
     if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
-        syslog(LOG_ERR, "ioctl TUNSETIFF failed: %s", strerror(errno));
+        syslog(LOG_ERR, "Ошибка ioctl TUNSETIFF: %s", strerror(errno));
         close(fd);
         return -1;
     }
@@ -68,7 +68,7 @@ int createTunDevice(std::string_view name, std::string_view ip) {
     system(::fmt::format("ip addr add {}/24 dev {}", ip, name).c_str());
     system(::fmt::format("ip link set {} up 2>/dev/null", name).c_str());
     system("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null");
-    syslog(LOG_INFO, "TUN device %s created with IP %s", name.data(), ip.data());
+    syslog(LOG_INFO, "TUN-устройство %s создано с IP-адресом %s", name.data(), ip.data());
     return fd;
 }
 
@@ -78,9 +78,9 @@ void setupClientRoutes(const std::string& tun_name = "tun0") {
 
     std::string cmd = "ip route add default via 192.168.200.1 dev " + tun_name + " 2>/dev/null";
     if (system(cmd.c_str()) != 0) {
-        syslog(LOG_ERR, "Failed to set default route through VPN");
+        syslog(LOG_ERR, "Не удалось установить маршрут по умолчанию через VPN");
     } else {
-        syslog(LOG_INFO, "Default route set through VPN on %s", tun_name.c_str());
+        syslog(LOG_INFO, "Маршрут по умолчанию установлен через VPN-интерфейс %s", tun_name.c_str());
     }
 }
 
@@ -94,7 +94,7 @@ void setupServerRoutes(std::string_view tun_name, std::string_view external_ifac
     system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
     system(::fmt::format("iptables -I INPUT 1 -p udp --dport {} -j ACCEPT", vpn_port).c_str());
     system("echo 1 > /proc/sys/net/ipv4/ip_forward");
-    syslog(LOG_INFO, "NAT and forwarding rules configured for %s through %s on UDP port %lu", tun_name.data(), external_iface.data(), vpn_port);
+    syslog(LOG_INFO, "Правила NAT и forwarding настроены для %s через %s на UDP-порту %lu", tun_name.data(), external_iface.data(), vpn_port);
 }
 
 // Получение имени внешнего интерфейса
@@ -112,6 +112,7 @@ std::string getDefaultInterface() {
     pclose(fp);
     return "ens3";
 }
+
 std::string getDefaultGateway() {
     FILE* fp = popen("ip route | grep default | awk '{print $3}'", "r");
     if (!fp) return "";
@@ -149,7 +150,7 @@ class TunDevice {
         if (m_fd < 0) return false;
         ssize_t written = ::write(m_fd, data, length);
         if (written < 0) {
-            syslog(LOG_ERR, "TUN write failed: %s", strerror(errno));
+            syslog(LOG_ERR, "Ошибка записи в TUN: %s", strerror(errno));
             return false;
         }
         return written == static_cast<ssize_t>(length);

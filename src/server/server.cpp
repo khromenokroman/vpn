@@ -34,24 +34,24 @@ class VPNServer {
 
     bool init() {
         if (!tun_device->open(m_tun_name, m_tun_ip)) {
-            syslog(LOG_ERR, "Failed to create TUN device");
+            syslog(LOG_ERR, "Не удалось создать TUN-устройство");
             return false;
         }
         setupServerRoutes(m_tun_name, m_external_iface, m_port);
         char hostname[256];
         gethostname(hostname, sizeof(hostname));
-        syslog(LOG_INFO, "VPN Server initialized on port %zu", m_port);
-        syslog(LOG_INFO, "Hostname: %s, Interface: %s", hostname, m_external_iface.c_str());
+        syslog(LOG_INFO, "VPN-сервер инициализирован на порту %zu", m_port);
+        syslog(LOG_INFO, "Имя хоста: %s, внешний интерфейс: %s", hostname, m_external_iface.c_str());
         return true;
     }
 
     void run() {
-        syslog(LOG_INFO, "VPN Server starting...");
+        syslog(LOG_INFO, "Запуск VPN-сервера...");
         tun_thread = std::thread([this]() { tunReadLoop(); });
         startUdpRead();
         startCleanupTimer();
         io_thread = std::thread([this]() { io_context.run(); });
-        syslog(LOG_INFO, "VPN Server running");
+        syslog(LOG_INFO, "VPN-сервер запущен");
     }
 
     void stop() {
@@ -61,7 +61,7 @@ class VPNServer {
         if (tun_thread.joinable()) tun_thread.join();
         udp_socket.close();
         tun_device->close();
-        syslog(LOG_INFO, "VPN Server stopped");
+        syslog(LOG_INFO, "VPN-сервер остановлен");
     }
 
    private:
@@ -73,7 +73,7 @@ class VPNServer {
                 std::vector<char> data(buffer, buffer + n);
                 boost::asio::post(io_context, [this, data]() { this->onTunData(data.data(), data.size()); });
             } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                if (running) syslog(LOG_ERR, "TUN read error: %s", strerror(errno));
+                if (running) syslog(LOG_ERR, "Ошибка чтения из TUN: %s", strerror(errno));
                 break;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -84,11 +84,11 @@ class VPNServer {
         if (!running) return;
         udp_socket.async_receive_from(boost::asio::buffer(udp_buffer), remote_endpoint, [this](const boost::system::error_code& ec, size_t bytes) {
             if (ec) {
-                if (ec != boost::asio::error::operation_aborted) syslog(LOG_ERR, "UDP receive error: %s", ec.message().c_str());
+                if (ec != boost::asio::error::operation_aborted) syslog(LOG_ERR, "Ошибка приёма UDP-пакета: %s", ec.message().c_str());
                 return;
             }
             if (bytes > 0) {
-                syslog(LOG_ERR, "UDP receive bytes: %lu", bytes);
+                syslog(LOG_DEBUG, "Получено UDP-байт: %zu", bytes);
                 this->onUdpData(udp_buffer.data(), bytes, remote_endpoint);
             }
             if (running) startUdpRead();
@@ -123,12 +123,12 @@ class VPNServer {
         if (it != clients.end()) {
             try {
                 udp_socket.send_to(boost::asio::buffer(data, length), it->second);
-                syslog(LOG_DEBUG, "Forwarded packet to client %s (%zu bytes)", dest_ip, length);
+                syslog(LOG_DEBUG, "Пакет отправлен клиенту %s, размер: %zu байт", dest_ip, length);
             } catch (const std::exception& e) {
-                syslog(LOG_ERR, "Failed to send to client: %s", e.what());
+                syslog(LOG_ERR, "Не удалось отправить пакет клиенту: %s", e.what());
             }
         } else {
-            syslog(LOG_DEBUG, "Packet for unknown client: %s", dest_ip);
+            syslog(LOG_DEBUG, "Пакет для неизвестного клиента: %s", dest_ip);
         }
     }
 
@@ -141,18 +141,18 @@ class VPNServer {
         if (strncmp(src_ip, "192.168.200.", 12) == 0) {
             std::string client_ip(src_ip);
             if (clients.find(client_ip) == clients.end()) {
-                syslog(LOG_INFO, "New client connected: %s from %s:%d", client_ip.c_str(), endpoint.address().to_string().c_str(), endpoint.port());
+                syslog(LOG_INFO, "Подключён новый клиент: %s с адреса %s:%d", client_ip.c_str(), endpoint.address().to_string().c_str(), endpoint.port());
             }
             clients[client_ip] = endpoint;
             client_last_seen[client_ip] = std::chrono::steady_clock::now();
             if (!tun_device->write(data, length)) {
-                syslog(LOG_ERR, "Failed to write packet to TUN");
+                syslog(LOG_ERR, "Не удалось записать пакет в TUN");
             } else {
-                syslog(LOG_DEBUG, "Successfully wrote to TUN");
+                syslog(LOG_DEBUG, "Пакет успешно записан в TUN");
             }
-            syslog(LOG_DEBUG, "Forwarded packet from client %s (%zu bytes)", client_ip.c_str(), length);
+            syslog(LOG_DEBUG, "Пакет от клиента %s обработан, размер: %zu байт", client_ip.c_str(), length);
         } else {
-            syslog(LOG_DEBUG, "Packet from invalid source IP: %s", src_ip);
+            syslog(LOG_DEBUG, "Пакет с недопустимым исходным IP: %s", src_ip);
         }
     }
 
@@ -162,7 +162,7 @@ class VPNServer {
         while (it != client_last_seen.end()) {
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second);
             if (elapsed.count() > 60) {
-                syslog(LOG_INFO, "Removing inactive client: %s", it->first.c_str());
+                syslog(LOG_WARNING, "Удаление неактивного клиента: %s", it->first.c_str());
                 clients.erase(it->first);
                 it = client_last_seen.erase(it);
             } else {
@@ -175,32 +175,38 @@ class VPNServer {
 int main(int argc, char* argv[]) {
     initSyslog("vpn-server");
     signal(SIGINT, [](int) {
-        syslog(LOG_INFO, "Received SIGINT");
-        EXIT_SUCCESS;
+        syslog(LOG_INFO, "Получен сигнал SIGINT");
+        exit(EXIT_SUCCESS);
     });
     signal(SIGTERM, [](int) {
-        syslog(LOG_INFO, "Received SIGTERM");
-        EXIT_SUCCESS;
+        syslog(LOG_INFO, "Получен сигнал SIGTERM");
+        exit(EXIT_SUCCESS);
     });
 
     if (geteuid() != 0) {
-        syslog(LOG_ERR, "Must be run as root");
-        EXIT_FAILURE;
+        syslog(LOG_ERR, "Сервер должен быть запущен от имени root");
+        return EXIT_FAILURE;
     }
+    if (argc < 2) {
+        syslog(LOG_ERR, "Не указан порт для прослушивания. Использование: %s <port>", argv[0]);
+        return EXIT_FAILURE;
+    }
+
     std::size_t port = atoll(argv[1]);
     if (port <= 0 || port > 65535) {
-        syslog(LOG_ERR, "Invalid port: %s", argv[1]);
-        EXIT_FAILURE;
+        syslog(LOG_ERR, "Недопустимый порт: %s", argv[1]);
+        return EXIT_FAILURE;
     }
-    syslog(LOG_INFO, "Starting VPN Server on port %zu", port);
+
+    syslog(LOG_INFO, "Запуск VPN-сервера на порту %zu", port);
     VPNServer server("tun0", "192.168.200.1", port);
     if (!server.init()) {
-        syslog(LOG_ERR, "Failed to initialize server");
+        syslog(LOG_ERR, "Не удалось инициализировать сервер");
         closelog();
-        return 1;
+        return EXIT_FAILURE;
     }
     server.run();
     while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
     closeSyslog();
-    return 0;
+    return EXIT_SUCCESS;
 }
