@@ -8,6 +8,7 @@ set(CMAKE_CXX_STANDARD 17)
 
 find_package(fmt REQUIRED)
 find_package(Boost REQUIRED COMPONENTS program_options)
+find_library(SODIUM_LIBRARY sodium REQUIRED)
 
 add_subdirectory(src/server)
 add_subdirectory(src/client)
