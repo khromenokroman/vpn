@@ -5,8 +5,10 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <boost/program_options.hpp>
 #include <csignal>
 #include <cstring>
+#include <iostream>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
@@ -22,7 +24,8 @@ class VPNServer {
 
     std::string m_tun_name;
     std::string m_tun_ip;
-    int m_port;
+    std::size_t m_port;
+    std::size_t m_mtu;
     std::string m_external_iface;
 
     // Ключ — IP в network byte order (uint32_t). Значение — адрес клиента и время.
@@ -41,7 +44,8 @@ class VPNServer {
     std::atomic<uint64_t> m_packets_from_clients{0};
 
    public:
-    VPNServer(std::string_view tun_name, std::string_view tun_ip, int port) : m_tun_name(tun_name), m_tun_ip(tun_ip), m_port(port) {
+    VPNServer(std::string_view tun_name, std::string_view tun_ip, std::size_t port, std::size_t mtu)
+        : m_tun_name(tun_name), m_tun_ip(tun_ip), m_port(port), m_mtu{mtu} {
         m_external_iface = Os().getDefaultInterface();
     }
 
@@ -49,7 +53,7 @@ class VPNServer {
 
     bool init() {
         // 1. TUN
-        if (!m_tun.open(m_tun_name, m_tun_ip, 1420)) {
+        if (!m_tun.open(m_tun_name, m_tun_ip, m_mtu)) {
             syslog(LOG_ERR, "Не удалось создать TUN-устройство");
             return false;
         }
@@ -82,7 +86,7 @@ class VPNServer {
 
         char hostname[256];
         gethostname(hostname, sizeof(hostname));
-        syslog(LOG_INFO, "VPN-сервер инициализирован на порту %d", m_port);
+        syslog(LOG_INFO, "VPN-сервер инициализирован на порту %zu", m_port);
         syslog(LOG_INFO, "Хост: %s, внешний интерфейс: %s", hostname, m_external_iface.c_str());
         return true;
     }
@@ -101,7 +105,7 @@ class VPNServer {
             if (!m_running) break;
             uint64_t to = m_packets_to_clients.load();
             uint64_t from = m_packets_from_clients.load();
-            syslog(LOG_INFO, "Статистика: TUN->клиентам=%lu (+%lu), клиенты->TUN=%lu (+%lu), клиентов=%zu", to, to - last_to, from, from - last_from,
+            syslog(LOG_DEBUG, "Статистика: TUN->клиентам=%lu (+%lu), клиенты->TUN=%lu (+%lu), клиентов=%zu", to, to - last_to, from, from - last_from,
                    m_clients.size());
             last_to = to;
             last_from = from;
@@ -240,6 +244,7 @@ class VPNServer {
 };
 
 static VPNServer* g_server = nullptr;
+namespace po = boost::program_options;
 
 int main(int argc, char* argv[]) {
     Os().initSyslog("vpn-server", LOG_INFO);
@@ -259,19 +264,53 @@ int main(int argc, char* argv[]) {
         syslog(LOG_ERR, "Сервер должен быть запущен от имени root");
         return EXIT_FAILURE;
     }
-    if (argc < 2) {
-        syslog(LOG_ERR, "Использование: %s <port>", argv[0]);
+
+    int port = 0;
+    int mtu = 1420;
+    std::string tun_name;
+    std::string tun_ip;
+
+    po::options_description desc("Параметры VPN-сервера");
+    desc.add_options()
+        ("help,h", "показать справку")
+        ("port,p",     po::value<int>(&port)->required(),                "UDP-порт для прослушивания")
+        ("mtu,m",      po::value<int>(&mtu)->default_value(1420),         "MTU TUN-интерфейса")
+        ("tun-name,n", po::value<std::string>(&tun_name)->default_value("tun0"),
+                                                                          "имя TUN-интерфейса")
+        ("tun-ip,i",   po::value<std::string>(&tun_ip)->default_value("192.168.200.1"),
+                                                                          "IP-адрес TUN-интерфейса");
+
+    po::variables_map vm;
+    try {
+        po::store(po::parse_command_line(argc, argv, desc), vm);
+
+        if (vm.count("help")) {
+            std::cout << desc << std::endl;
+            return EXIT_SUCCESS;
+        }
+
+        po::notify(vm);
+    } catch (const po::error& e) {
+        std::cerr << "Ошибка параметров: " << e.what() << "\n\n" << desc << std::endl;
+        syslog(LOG_ERR, "Ошибка параметров: %s", e.what());
         return EXIT_FAILURE;
     }
 
-    int port = atoi(argv[1]);
     if (port <= 0 || port > 65535) {
-        syslog(LOG_ERR, "Недопустимый порт: %s", argv[1]);
+        std::cerr << "Недопустимый порт: " << port << std::endl;
+        syslog(LOG_ERR, "Недопустимый порт: %d", port);
+        return EXIT_FAILURE;
+    }
+    if (mtu < 576 || mtu > 65535) {
+        std::cerr << "Недопустимый MTU: " << mtu << std::endl;
+        syslog(LOG_ERR, "Недопустимый MTU: %d", mtu);
         return EXIT_FAILURE;
     }
 
-    syslog(LOG_INFO, "Запуск VPN-сервера на порту %d", port);
-    VPNServer server("tun0", "192.168.200.1", port);
+    syslog(LOG_INFO, "Запуск VPN-сервера: port=%d, mtu=%d, tun=%s/%s",
+           port, mtu, tun_name.c_str(), tun_ip.c_str());
+
+    VPNServer server(tun_name, tun_ip, port, mtu);
     g_server = &server;
 
     if (!server.init()) {
