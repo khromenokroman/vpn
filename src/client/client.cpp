@@ -1,7 +1,15 @@
 #include <arpa/inet.h>
+#include <linux/ip.h>
 #include <sys/socket.h>
+#include <sys/syslog.h>
 
-#include "../common/common.hpp"
+#include <atomic>
+#include <csignal>
+#include <cstring>
+#include <thread>
+
+#include "../share/device.hpp"
+#include "../share/os.hpp"
 
 class VPNClient {
    private:
@@ -26,14 +34,14 @@ class VPNClient {
 
     bool init() {
         // 1. Создаём TUN
-        if (!m_tun.open("tun0", "192.168.200.2")) {
+        if (!m_tun.open("tun0", "192.168.200.2", 1420)) {
             syslog(LOG_ERR, "Не удалось создать TUN-устройство");
             return false;
         }
 
         // 2. Запоминаем интерфейс и шлюз ДО изменения маршрутов
-        std::string iface = getDefaultInterface();
-        std::string gateway = getDefaultGateway();
+        std::string iface = Os().getDefaultInterface();
+        std::string gateway = Os().getDefaultGateway();
 
         // 3. Добавляем маршрут до сервера через реальный интерфейс
         if (!gateway.empty() && !iface.empty()) {
@@ -46,7 +54,7 @@ class VPNClient {
         }
 
         // 4. Маршрут по умолчанию через tun0
-        setupClientRoutes();
+        Os().setupClientRoutes();
 
         // 5. Создаём UDP-сокет
         m_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -65,7 +73,7 @@ class VPNClient {
         }
 
         // 7. Увеличиваем буферы UDP-сокета
-        tuneUdpSocket(m_udp_fd);
+        Os().tuneUdpSocket(m_udp_fd);
 
         // 8. Адрес сервера
         m_server_addr.sin_family = AF_INET;
@@ -188,7 +196,7 @@ class VPNClient {
 static VPNClient* g_client = nullptr;
 
 int main(int argc, char* argv[]) {
-    initSyslog("vpn-client", LOG_INFO);
+    Os().initSyslog("vpn-client", LOG_INFO);
     signal(SIGINT, [](int) {
         syslog(LOG_INFO, "Получен сигнал SIGINT");
         if (g_client) g_client->stop();
@@ -229,6 +237,6 @@ int main(int argc, char* argv[]) {
     }
     client.run();
 
-    closeSyslog();
+    Os().closeSyslog();
     return EXIT_SUCCESS;
 }
