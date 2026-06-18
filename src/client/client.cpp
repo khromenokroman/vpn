@@ -34,6 +34,21 @@ class VPNClient {
             syslog(LOG_ERR, "Не удалось создать TUN-устройство");
             return false;
         }
+
+        // Сохраняем текущий интерфейс и шлюз до изменения маршрутов
+        std::string iface = getDefaultInterface();
+        std::string gateway = getDefaultGateway();
+
+        // Добавляем маршрут до сервера через реальный интерфейс
+        if (!gateway.empty() && !iface.empty()) {
+            std::string cmd = "ip route add " + server_ip + " via " + gateway + " dev " + iface + " 2>/dev/null";
+            if (system(cmd.c_str()) != 0) {
+                syslog(LOG_WARNING, "Не удалось добавить маршрут до сервера, возможно уже существует");
+            } else {
+                syslog(LOG_INFO, "Добавлен маршрут до сервера %s через %s dev %s", server_ip.c_str(), gateway.c_str(), iface.c_str());
+            }
+        }
+
         setupClientRoutes();
 
         boost::system::error_code ec;
@@ -45,6 +60,14 @@ class VPNClient {
         server_endpoint = ep;
 
         udp_socket.open(udp::v4());
+
+        if (!iface.empty()) {
+            if (setsockopt(udp_socket.native_handle(), SOL_SOCKET, SO_BINDTODEVICE, iface.c_str(), iface.length()) < 0) {
+                syslog(LOG_WARNING, "Failed to bind UDP socket to interface %s: %s", iface.c_str(), strerror(errno));
+            } else {
+                syslog(LOG_INFO, "UDP socket bound to interface %s", iface.c_str());
+            }
+        }
 
         syslog(LOG_INFO, "VPN-клиент инициализирован, сервер: %s:%d", server_ip.c_str(), server_port);
         return true;

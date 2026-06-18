@@ -18,11 +18,12 @@ class VPNServer {
 
     std::thread io_thread;
     std::thread tun_thread;
-    std::string m_external_iface{"ens3"};
+    std::string m_external_iface;
 
    public:
     VPNServer(std::string_view tun_name, std::string_view tun_ip, std::size_t port)
         : io_context(), udp_socket(io_context, udp::endpoint(udp::v4(), port)), running(true), m_tun_name{tun_name}, m_tun_ip{tun_ip}, m_port{port} {
+        m_external_iface = getDefaultInterface();
         tun_device = std::make_unique<TunDevice>();
     }
 
