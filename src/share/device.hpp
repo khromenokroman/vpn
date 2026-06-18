@@ -12,7 +12,6 @@ class TunDevice {
     int createTunDevice(std::string_view name, std::string_view ip, size_t mtu);
 
    private:
-    std::size_t m_mtu = 1400;
     std::string_view m_tun_device{"/dev/net/tun"};
     int m_fd;
 };

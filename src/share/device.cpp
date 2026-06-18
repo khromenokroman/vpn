@@ -46,10 +46,10 @@ int TunDevice::createTunDevice(std::string_view name, std::string_view ip, std::
     }
 
     system(::fmt::format("ip addr add {}/24 dev {}", ip, name).c_str());
-    system(::fmt::format("ip link set {} mtu {}", name, m_mtu).c_str());
+    system(::fmt::format("ip link set {} mtu {}", name, mtu).c_str());
     system(::fmt::format("ip link set {} txqueuelen 1000", name).c_str());
     system(::fmt::format("ip link set {} up 2>/dev/null", name).c_str());
     system("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null");
-    syslog(LOG_INFO, "TUN-устройство %s создано с IP %s, MTU %d", name.data(), ip.data(), mtu);
+    syslog(LOG_INFO, "TUN-устройство %s создано с IP %s, MTU %zu", name.data(), ip.data(), mtu);
     return fd;
 }
