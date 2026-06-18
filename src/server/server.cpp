@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "../share/crypto.hpp"
 #include "../share/device.hpp"
 #include "../share/os.hpp"
 
@@ -27,6 +28,7 @@ class VPNServer {
     std::size_t m_port;
     std::size_t m_mtu;
     std::string m_external_iface;
+    Crypto m_crypto;
 
     // Ключ — IP в network byte order (uint32_t). Значение — адрес клиента и время.
     struct ClientInfo {
@@ -44,8 +46,8 @@ class VPNServer {
     std::atomic<uint64_t> m_packets_from_clients{0};
 
    public:
-    VPNServer(std::string_view tun_name, std::string_view tun_ip, std::size_t port, std::size_t mtu)
-        : m_tun_name(tun_name), m_tun_ip(tun_ip), m_port(port), m_mtu{mtu} {
+    VPNServer(std::string_view tun_name, std::string_view tun_ip, std::size_t port, std::size_t mtu, std::string_view key)
+        : m_tun_name(tun_name), m_tun_ip(tun_ip), m_port(port), m_mtu{mtu}, m_crypto{key} {
         m_external_iface = Os().getDefaultInterface();
     }
 
@@ -129,10 +131,12 @@ class VPNServer {
    private:
     // Поток №1: TUN -> UDP (нужному клиенту по destination IP)
     void tunToUdpLoop() {
-        char buffer[BUFFER_SIZE];
+        char plain_buffer[BUFFER_SIZE];
+        char encrypted_buffer[BUFFER_SIZE + 128];
         int tun_fd = m_tun.getFd();
+
         while (m_running) {
-            ssize_t n = ::read(tun_fd, buffer, BUFFER_SIZE);
+            ssize_t n = ::read(tun_fd, plain_buffer, BUFFER_SIZE);
             if (n <= 0) {
                 if (n < 0 && errno != EINTR && m_running) {
                     syslog(LOG_ERR, "Ошибка чтения TUN: %s", strerror(errno));
@@ -140,10 +144,11 @@ class VPNServer {
                 if (n == 0 || (n < 0 && errno != EINTR)) break;
                 continue;
             }
+
             if (n < (ssize_t)sizeof(struct iphdr)) continue;
 
-            struct iphdr* ip = (struct iphdr*)buffer;
-            uint32_t dest = ip->daddr; // network byte order
+            struct iphdr* ip = (struct iphdr*)plain_buffer;
+            uint32_t dest = ip->daddr;
 
             sockaddr_in client_addr;
             bool found = false;
@@ -155,9 +160,15 @@ class VPNServer {
                     found = true;
                 }
             }
+
             if (!found) continue;
 
-            ssize_t sent = ::sendto(m_udp_fd, buffer, n, 0, (sockaddr*)&client_addr, sizeof(client_addr));
+            std::size_t encrypted_size = 0;
+            if (!m_crypto.encrypt(plain_buffer, static_cast<std::size_t>(n), encrypted_buffer, encrypted_size)) {
+                continue;
+            }
+
+            ssize_t sent = ::sendto(m_udp_fd, encrypted_buffer, encrypted_size, 0, (sockaddr*)&client_addr, sizeof(client_addr));
             if (sent > 0) {
                 m_packets_to_clients.fetch_add(1, std::memory_order_relaxed);
             } else if (sent < 0 && errno != EINTR && errno != EAGAIN && m_running) {
@@ -168,35 +179,38 @@ class VPNServer {
 
     // Поток №2: UDP -> TUN, плюс регистрация клиентов
     void udpToTunLoop() {
-        char buffer[BUFFER_SIZE];
+        char encrypted_buffer[BUFFER_SIZE + 128];
+        char plain_buffer[BUFFER_SIZE];
         int tun_fd = m_tun.getFd();
         sockaddr_in peer{};
         socklen_t peer_len = sizeof(peer);
 
         while (m_running) {
             peer_len = sizeof(peer);
-            ssize_t n = ::recvfrom(m_udp_fd, buffer, BUFFER_SIZE, 0, (sockaddr*)&peer, &peer_len);
+            ssize_t n = ::recvfrom(m_udp_fd, encrypted_buffer, sizeof(encrypted_buffer), 0, (sockaddr*)&peer, &peer_len);
             if (n <= 0) {
                 if (n < 0 && errno != EINTR && m_running) {
                     syslog(LOG_ERR, "Ошибка recvfrom: %s", strerror(errno));
                 }
-                if (n == 0) continue; // keep-alive
+                if (n == 0) continue;
                 if (n < 0 && errno != EINTR) break;
                 continue;
             }
-            if (n < (ssize_t)sizeof(struct iphdr)) continue;
 
-            struct iphdr* ip = (struct iphdr*)buffer;
-            uint32_t src = ip->saddr; // network byte order
+            std::size_t plain_size = 0;
+            if (!m_crypto.decrypt(encrypted_buffer, static_cast<std::size_t>(n), plain_buffer, plain_size)) {
+                continue;
+            }
 
-            // Проверяем, что IP из подсети 192.168.200.0/24
-            // network byte order: 192.168.200.X
-            // первые 3 байта = 0xC0 0xA8 0xC8
+            if (plain_size < sizeof(struct iphdr)) continue;
+
+            struct iphdr* ip = (struct iphdr*)plain_buffer;
+            uint32_t src = ip->saddr;
+
             if ((src & htonl(0xFFFFFF00)) != htonl(0xC0A8C800)) {
                 continue;
             }
 
-            // Регистрируем / обновляем клиента
             {
                 std::lock_guard<std::mutex> lk(m_clients_mutex);
                 auto it = m_clients.find(src);
@@ -211,7 +225,7 @@ class VPNServer {
                 }
             }
 
-            ssize_t written = ::write(tun_fd, buffer, n);
+            ssize_t written = ::write(tun_fd, plain_buffer, plain_size);
             if (written > 0) {
                 m_packets_from_clients.fetch_add(1);
             } else if (written < 0 && errno != EINTR && m_running) {
@@ -265,20 +279,23 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    if (sodium_init() < 0) {
+        syslog(LOG_ERR, "Не удалось инициализировать libsodium");
+        return EXIT_FAILURE;
+    }
+
     int port = 0;
     int mtu = 1420;
     std::string tun_name;
     std::string tun_ip;
+    std::string key;
 
     po::options_description desc("Параметры VPN-сервера");
-    desc.add_options()
-        ("help,h", "показать справку")
-        ("port,p",     po::value<int>(&port)->required(),                "UDP-порт для прослушивания")
-        ("mtu,m",      po::value<int>(&mtu)->default_value(1420),         "MTU TUN-интерфейса")
-        ("tun-name,n", po::value<std::string>(&tun_name)->default_value("tun0"),
-                                                                          "имя TUN-интерфейса")
-        ("tun-ip,i",   po::value<std::string>(&tun_ip)->default_value("192.168.200.1"),
-                                                                          "IP-адрес TUN-интерфейса");
+    desc.add_options()("help,h", "показать справку")("port,p", po::value<int>(&port)->required(), "UDP-порт для прослушивания")(
+        "mtu,m", po::value<int>(&mtu)->default_value(1420), "MTU TUN-интерфейса")(
+        "tun-name,n", po::value<std::string>(&tun_name)->default_value("tun0"), "имя TUN-интерфейса")(
+        "tun-ip,i", po::value<std::string>(&tun_ip)->default_value("192.168.200.1"), "IP-адрес TUN-интерфейса")(
+        "key,k", po::value<std::string>(&key)->required(), "общий ключ шифрования");
 
     po::variables_map vm;
     try {
@@ -307,10 +324,9 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    syslog(LOG_INFO, "Запуск VPN-сервера: port=%d, mtu=%d, tun=%s/%s",
-           port, mtu, tun_name.c_str(), tun_ip.c_str());
+    syslog(LOG_INFO, "Запуск VPN-сервера: port=%d, mtu=%d, tun=%s/%s", port, mtu, tun_name.c_str(), tun_ip.c_str());
 
-    VPNServer server(tun_name, tun_ip, port, mtu);
+    VPNServer server(tun_name, tun_ip, port, mtu, key);
     g_server = &server;
 
     if (!server.init()) {
