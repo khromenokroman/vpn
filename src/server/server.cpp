@@ -1,213 +1,282 @@
-#include <boost/asio.hpp>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+
+#include <mutex>
+#include <unordered_map>
 
 #include "../common/common.hpp"
 
 class VPNServer {
    private:
-    boost::asio::io_context io_context;
-    udp::socket udp_socket;
-    udp::endpoint remote_endpoint;
-    std::unique_ptr<TunDevice> tun_device;
-    std::atomic<bool> running;
+    int m_udp_fd = -1;
+    TunDevice m_tun;
+    std::atomic<bool> m_running{true};
+
     std::string m_tun_name;
     std::string m_tun_ip;
-    std::size_t m_port;
-    std::map<std::string, udp::endpoint> clients;
-    std::map<std::string, std::chrono::steady_clock::time_point> client_last_seen;
-    std::array<char, BUFFER_SIZE> udp_buffer;
-
-    std::thread io_thread;
-    std::thread tun_thread;
+    int m_port;
     std::string m_external_iface;
 
+    // Ключ — IP в network byte order (uint32_t). Значение — адрес клиента и время.
+    struct ClientInfo {
+        sockaddr_in addr;
+        std::chrono::steady_clock::time_point last_seen;
+    };
+    std::unordered_map<uint32_t, ClientInfo> m_clients;
+    std::mutex m_clients_mutex;
+
+    std::thread m_tun_to_udp_thread;
+    std::thread m_udp_to_tun_thread;
+    std::thread m_cleanup_thread;
+
+    std::atomic<uint64_t> m_packets_to_clients{0};
+    std::atomic<uint64_t> m_packets_from_clients{0};
+
    public:
-    VPNServer(std::string_view tun_name, std::string_view tun_ip, std::size_t port)
-        : io_context(), udp_socket(io_context, udp::endpoint(udp::v4(), port)), running(true), m_tun_name{tun_name}, m_tun_ip{tun_ip}, m_port{port} {
+    VPNServer(std::string_view tun_name, std::string_view tun_ip, int port)
+        : m_tun_name(tun_name), m_tun_ip(tun_ip), m_port(port) {
         m_external_iface = getDefaultInterface();
-        tun_device = std::make_unique<TunDevice>();
     }
 
-    ~VPNServer() {
-        stop();
-        closeSyslog();
-    }
+    ~VPNServer() { stop(); }
 
     bool init() {
-        if (!tun_device->open(m_tun_name, m_tun_ip)) {
+        // 1. TUN
+        if (!m_tun.open(m_tun_name, m_tun_ip)) {
             syslog(LOG_ERR, "Не удалось создать TUN-устройство");
             return false;
         }
+
+        // 2. iptables + ip_forward
         setupServerRoutes(m_tun_name, m_external_iface, m_port);
+
+        // 3. UDP-сокет
+        m_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+        if (m_udp_fd < 0) {
+            syslog(LOG_ERR, "Не удалось создать UDP-сокет: %s", strerror(errno));
+            return false;
+        }
+
+        int reuse = 1;
+        setsockopt(m_udp_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+
+        // 4. Бинд на порт
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons(m_port);
+        addr.sin_addr.s_addr = htonl(INADDR_ANY);
+        if (bind(m_udp_fd, (sockaddr*)&addr, sizeof(addr)) < 0) {
+            syslog(LOG_ERR, "Не удалось забиндить UDP-сокет: %s", strerror(errno));
+            return false;
+        }
+
+        // 5. Большие буферы
+        tuneUdpSocket(m_udp_fd);
+
         char hostname[256];
         gethostname(hostname, sizeof(hostname));
-        syslog(LOG_INFO, "VPN-сервер инициализирован на порту %zu", m_port);
-        syslog(LOG_INFO, "Имя хоста: %s, внешний интерфейс: %s", hostname, m_external_iface.c_str());
+        syslog(LOG_INFO, "VPN-сервер инициализирован на порту %d", m_port);
+        syslog(LOG_INFO, "Хост: %s, внешний интерфейс: %s", hostname, m_external_iface.c_str());
         return true;
     }
 
     void run() {
         syslog(LOG_INFO, "Запуск VPN-сервера...");
-        tun_thread = std::thread([this]() { tunReadLoop(); });
-        startUdpRead();
-        startCleanupTimer();
-        io_thread = std::thread([this]() { io_context.run(); });
+        m_tun_to_udp_thread = std::thread([this]() { tunToUdpLoop(); });
+        m_udp_to_tun_thread = std::thread([this]() { udpToTunLoop(); });
+        m_cleanup_thread = std::thread([this]() { cleanupLoop(); });
         syslog(LOG_INFO, "VPN-сервер запущен");
+
+        // Статистика в главном потоке
+        uint64_t last_to = 0, last_from = 0;
+        while (m_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            if (!m_running) break;
+            uint64_t to = m_packets_to_clients.load();
+            uint64_t from = m_packets_from_clients.load();
+            syslog(LOG_INFO, "Статистика: TUN->клиентам=%lu (+%lu), клиенты->TUN=%lu (+%lu), клиентов=%zu",
+                   to, to - last_to, from, from - last_from, m_clients.size());
+            last_to = to;
+            last_from = from;
+        }
     }
 
     void stop() {
-        running = false;
-        io_context.stop();
-        if (io_thread.joinable()) io_thread.join();
-        if (tun_thread.joinable()) tun_thread.join();
-        udp_socket.close();
-        tun_device->close();
+        if (!m_running.exchange(false)) return;
+        if (m_udp_fd >= 0) {
+            shutdown(m_udp_fd, SHUT_RDWR);
+            ::close(m_udp_fd);
+            m_udp_fd = -1;
+        }
+        m_tun.close();
+        if (m_tun_to_udp_thread.joinable()) m_tun_to_udp_thread.join();
+        if (m_udp_to_tun_thread.joinable()) m_udp_to_tun_thread.join();
+        if (m_cleanup_thread.joinable()) m_cleanup_thread.join();
         syslog(LOG_INFO, "VPN-сервер остановлен");
     }
 
    private:
-    void tunReadLoop() {
+    // Поток №1: TUN -> UDP (нужному клиенту по destination IP)
+    void tunToUdpLoop() {
         char buffer[BUFFER_SIZE];
-        while (running) {
-            int n = read(tun_device->getFd(), buffer, BUFFER_SIZE);
-            if (n > 0) {
-                std::vector<char> data(buffer, buffer + n);
-                boost::asio::post(io_context, [this, data]() { this->onTunData(data.data(), data.size()); });
-            } else if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
-                if (running) syslog(LOG_ERR, "Ошибка чтения из TUN: %s", strerror(errno));
-                break;
+        int tun_fd = m_tun.getFd();
+        while (m_running) {
+            ssize_t n = ::read(tun_fd, buffer, BUFFER_SIZE);
+            if (n <= 0) {
+                if (n < 0 && errno != EINTR && m_running) {
+                    syslog(LOG_ERR, "Ошибка чтения TUN: %s", strerror(errno));
+                }
+                if (n == 0 || (n < 0 && errno != EINTR)) break;
+                continue;
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            if (n < (ssize_t)sizeof(struct iphdr)) continue;
+
+            struct iphdr* ip = (struct iphdr*)buffer;
+            uint32_t dest = ip->daddr;  // network byte order
+
+            sockaddr_in client_addr;
+            bool found = false;
+            {
+                std::lock_guard<std::mutex> lk(m_clients_mutex);
+                auto it = m_clients.find(dest);
+                if (it != m_clients.end()) {
+                    client_addr = it->second.addr;
+                    found = true;
+                }
+            }
+            if (!found) continue;
+
+            ssize_t sent = ::sendto(m_udp_fd, buffer, n, 0,
+                                    (sockaddr*)&client_addr, sizeof(client_addr));
+            if (sent > 0) {
+                m_packets_to_clients.fetch_add(1, std::memory_order_relaxed);
+            } else if (sent < 0 && errno != EINTR && errno != EAGAIN && m_running) {
+                syslog(LOG_ERR, "sendto клиенту: %s", strerror(errno));
+            }
         }
     }
 
-    void startUdpRead() {
-        if (!running) return;
-        udp_socket.async_receive_from(boost::asio::buffer(udp_buffer), remote_endpoint, [this](const boost::system::error_code& ec, size_t bytes) {
-            if (ec) {
-                if (ec != boost::asio::error::operation_aborted) syslog(LOG_ERR, "Ошибка приёма UDP-пакета: %s", ec.message().c_str());
-                return;
-            }
-            if (bytes > 0) {
-                syslog(LOG_DEBUG, "Получено UDP-байт: %zu", bytes);
-                this->onUdpData(udp_buffer.data(), bytes, remote_endpoint);
-            }
-            if (running) startUdpRead();
-        });
-    }
+    // Поток №2: UDP -> TUN, плюс регистрация клиентов
+    void udpToTunLoop() {
+        char buffer[BUFFER_SIZE];
+        int tun_fd = m_tun.getFd();
+        sockaddr_in peer{};
+        socklen_t peer_len = sizeof(peer);
 
-    void startCleanupTimer() {
-        auto timer = std::make_shared<boost::asio::steady_timer>(io_context, std::chrono::seconds(10));
-        timer->async_wait([this, timer](const boost::system::error_code& ec) {
-            if (ec) return;
-            this->cleanupClients();
-            if (running) {
-                timer->expires_after(std::chrono::seconds(10));
-                timer->async_wait([this, timer](const boost::system::error_code& ec2) {
-                    if (!ec2 && running) {
-                        this->cleanupClients();
-                        timer->expires_after(std::chrono::seconds(10));
-                        this->startCleanupTimer();
-                    }
-                });
+        while (m_running) {
+            peer_len = sizeof(peer);
+            ssize_t n = ::recvfrom(m_udp_fd, buffer, BUFFER_SIZE, 0,
+                                   (sockaddr*)&peer, &peer_len);
+            if (n <= 0) {
+                if (n < 0 && errno != EINTR && m_running) {
+                    syslog(LOG_ERR, "Ошибка recvfrom: %s", strerror(errno));
+                }
+                if (n == 0) continue;  // keep-alive
+                if (n < 0 && errno != EINTR) break;
+                continue;
             }
-        });
-    }
+            if (n < (ssize_t)sizeof(struct iphdr)) continue;
 
-    void onTunData(const char* data, size_t length) {
-        if (length < sizeof(struct iphdr)) return;
-        struct iphdr* ip_header = (struct iphdr*)data;
-        char dest_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &ip_header->daddr, dest_ip, INET_ADDRSTRLEN);
-        std::string ip_str(dest_ip);
-        auto it = clients.find(ip_str);
-        if (it != clients.end()) {
-            try {
-                udp_socket.send_to(boost::asio::buffer(data, length), it->second);
-                syslog(LOG_DEBUG, "Пакет отправлен клиенту %s, размер: %zu байт", dest_ip, length);
-            } catch (const std::exception& e) {
-                syslog(LOG_ERR, "Не удалось отправить пакет клиенту: %s", e.what());
+            struct iphdr* ip = (struct iphdr*)buffer;
+            uint32_t src = ip->saddr;  // network byte order
+
+            // Проверяем, что IP из подсети 192.168.200.0/24
+            // network byte order: 192.168.200.X
+            // первые 3 байта = 0xC0 0xA8 0xC8
+            if ((src & htonl(0xFFFFFF00)) != htonl(0xC0A8C800)) {
+                continue;
             }
-        } else {
-            syslog(LOG_DEBUG, "Пакет для неизвестного клиента: %s", dest_ip);
+
+            // Регистрируем / обновляем клиента
+            {
+                std::lock_guard<std::mutex> lk(m_clients_mutex);
+                auto it = m_clients.find(src);
+                if (it == m_clients.end()) {
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &src, ip_str, INET_ADDRSTRLEN);
+                    syslog(LOG_INFO, "Новый клиент: %s с %s:%d",
+                           ip_str, inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
+                    m_clients[src] = {peer, std::chrono::steady_clock::now()};
+                } else {
+                    it->second.addr = peer;
+                    it->second.last_seen = std::chrono::steady_clock::now();
+                }
+            }
+
+            ssize_t written = ::write(tun_fd, buffer, n);
+            if (written > 0) {
+                m_packets_from_clients.fetch_add(1, std::memory_order_relaxed);
+            } else if (written < 0 && errno != EINTR && m_running) {
+                syslog(LOG_ERR, "Ошибка записи в TUN: %s", strerror(errno));
+            }
         }
     }
 
-    void onUdpData(const char* data, size_t length, const udp::endpoint& endpoint) {
-        if (length < sizeof(struct iphdr)) return;
-        struct iphdr* ip_header = (struct iphdr*)data;
-        char src_ip[INET_ADDRSTRLEN];
-        inet_ntop(AF_INET, &ip_header->saddr, src_ip, INET_ADDRSTRLEN);
+    // Поток №3: очистка неактивных клиентов
+    void cleanupLoop() {
+        while (m_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            if (!m_running) break;
 
-        if (strncmp(src_ip, "192.168.200.", 12) == 0) {
-            std::string client_ip(src_ip);
-            if (clients.find(client_ip) == clients.end()) {
-                syslog(LOG_INFO, "Подключён новый клиент: %s с адреса %s:%d", client_ip.c_str(), endpoint.address().to_string().c_str(),
-                       endpoint.port());
-            }
-            clients[client_ip] = endpoint;
-            client_last_seen[client_ip] = std::chrono::steady_clock::now();
-            if (!tun_device->write(data, length)) {
-                syslog(LOG_ERR, "Не удалось записать пакет в TUN");
-            } else {
-                syslog(LOG_DEBUG, "Пакет успешно записан в TUN");
-            }
-            syslog(LOG_DEBUG, "Пакет от клиента %s обработан, размер: %zu байт", client_ip.c_str(), length);
-        } else {
-            syslog(LOG_DEBUG, "Пакет с недопустимым исходным IP: %s", src_ip);
-        }
-    }
-
-    void cleanupClients() {
-        auto now = std::chrono::steady_clock::now();
-        auto it = client_last_seen.begin();
-        while (it != client_last_seen.end()) {
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second);
-            if (elapsed.count() > 60) {
-                syslog(LOG_WARNING, "Удаление неактивного клиента: %s", it->first.c_str());
-                clients.erase(it->first);
-                it = client_last_seen.erase(it);
-            } else {
-                ++it;
+            auto now = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lk(m_clients_mutex);
+            for (auto it = m_clients.begin(); it != m_clients.end();) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - it->second.last_seen);
+                if (elapsed.count() > 60) {
+                    char ip_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &it->first, ip_str, INET_ADDRSTRLEN);
+                    syslog(LOG_WARNING, "Удалён неактивный клиент: %s", ip_str);
+                    it = m_clients.erase(it);
+                } else {
+                    ++it;
+                }
             }
         }
     }
 };
 
+static VPNServer* g_server = nullptr;
+
 int main(int argc, char* argv[]) {
     initSyslog("vpn-server", LOG_INFO);
     signal(SIGINT, [](int) {
         syslog(LOG_INFO, "Получен сигнал SIGINT");
+        if (g_server) g_server->stop();
         exit(EXIT_SUCCESS);
     });
     signal(SIGTERM, [](int) {
         syslog(LOG_INFO, "Получен сигнал SIGTERM");
+        if (g_server) g_server->stop();
         exit(EXIT_SUCCESS);
     });
+    signal(SIGPIPE, SIG_IGN);
 
     if (geteuid() != 0) {
         syslog(LOG_ERR, "Сервер должен быть запущен от имени root");
         return EXIT_FAILURE;
     }
     if (argc < 2) {
-        syslog(LOG_ERR, "Не указан порт для прослушивания. Использование: %s <port>", argv[0]);
+        syslog(LOG_ERR, "Использование: %s <port>", argv[0]);
         return EXIT_FAILURE;
     }
 
-    std::size_t port = atoll(argv[1]);
+    int port = atoi(argv[1]);
     if (port <= 0 || port > 65535) {
         syslog(LOG_ERR, "Недопустимый порт: %s", argv[1]);
         return EXIT_FAILURE;
     }
 
-    syslog(LOG_INFO, "Запуск VPN-сервера на порту %zu", port);
+    syslog(LOG_INFO, "Запуск VPN-сервера на порту %d", port);
     VPNServer server("tun0", "192.168.200.1", port);
+    g_server = &server;
+
     if (!server.init()) {
         syslog(LOG_ERR, "Не удалось инициализировать сервер");
-        closelog();
         return EXIT_FAILURE;
     }
     server.run();
-    while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
+
     closeSyslog();
     return EXIT_SUCCESS;
 }
