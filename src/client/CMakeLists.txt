@@ -13,4 +13,6 @@ target_include_directories(${APP_NAME}
 target_link_libraries(${APP_NAME}
         PRIVATE
         fmt::fmt
+        Boost::program_options
+        pthread
 )
