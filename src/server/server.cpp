@@ -1,10 +1,18 @@
 #include <arpa/inet.h>
+#include <linux/ip.h>
 #include <sys/socket.h>
+#include <sys/syslog.h>
+#include <unistd.h>
 
+#include <atomic>
+#include <csignal>
+#include <cstring>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 
-#include "../common/common.hpp"
+#include "../share/device.hpp"
+#include "../share/os.hpp"
 
 class VPNServer {
    private:
@@ -33,22 +41,21 @@ class VPNServer {
     std::atomic<uint64_t> m_packets_from_clients{0};
 
    public:
-    VPNServer(std::string_view tun_name, std::string_view tun_ip, int port)
-        : m_tun_name(tun_name), m_tun_ip(tun_ip), m_port(port) {
-        m_external_iface = getDefaultInterface();
+    VPNServer(std::string_view tun_name, std::string_view tun_ip, int port) : m_tun_name(tun_name), m_tun_ip(tun_ip), m_port(port) {
+        m_external_iface = Os().getDefaultInterface();
     }
 
     ~VPNServer() { stop(); }
 
     bool init() {
         // 1. TUN
-        if (!m_tun.open(m_tun_name, m_tun_ip)) {
+        if (!m_tun.open(m_tun_name, m_tun_ip, 1420)) {
             syslog(LOG_ERR, "Не удалось создать TUN-устройство");
             return false;
         }
 
         // 2. iptables + ip_forward
-        setupServerRoutes(m_tun_name, m_external_iface, m_port);
+        Os().setupServerRoutes(m_tun_name, m_external_iface, m_port);
 
         // 3. UDP-сокет
         m_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -71,7 +78,7 @@ class VPNServer {
         }
 
         // 5. Большие буферы
-        tuneUdpSocket(m_udp_fd);
+        Os().tuneUdpSocket(m_udp_fd);
 
         char hostname[256];
         gethostname(hostname, sizeof(hostname));
@@ -94,8 +101,8 @@ class VPNServer {
             if (!m_running) break;
             uint64_t to = m_packets_to_clients.load();
             uint64_t from = m_packets_from_clients.load();
-            syslog(LOG_INFO, "Статистика: TUN->клиентам=%lu (+%lu), клиенты->TUN=%lu (+%lu), клиентов=%zu",
-                   to, to - last_to, from, from - last_from, m_clients.size());
+            syslog(LOG_INFO, "Статистика: TUN->клиентам=%lu (+%lu), клиенты->TUN=%lu (+%lu), клиентов=%zu", to, to - last_to, from, from - last_from,
+                   m_clients.size());
             last_to = to;
             last_from = from;
         }
@@ -132,7 +139,7 @@ class VPNServer {
             if (n < (ssize_t)sizeof(struct iphdr)) continue;
 
             struct iphdr* ip = (struct iphdr*)buffer;
-            uint32_t dest = ip->daddr;  // network byte order
+            uint32_t dest = ip->daddr; // network byte order
 
             sockaddr_in client_addr;
             bool found = false;
@@ -146,8 +153,7 @@ class VPNServer {
             }
             if (!found) continue;
 
-            ssize_t sent = ::sendto(m_udp_fd, buffer, n, 0,
-                                    (sockaddr*)&client_addr, sizeof(client_addr));
+            ssize_t sent = ::sendto(m_udp_fd, buffer, n, 0, (sockaddr*)&client_addr, sizeof(client_addr));
             if (sent > 0) {
                 m_packets_to_clients.fetch_add(1, std::memory_order_relaxed);
             } else if (sent < 0 && errno != EINTR && errno != EAGAIN && m_running) {
@@ -165,20 +171,19 @@ class VPNServer {
 
         while (m_running) {
             peer_len = sizeof(peer);
-            ssize_t n = ::recvfrom(m_udp_fd, buffer, BUFFER_SIZE, 0,
-                                   (sockaddr*)&peer, &peer_len);
+            ssize_t n = ::recvfrom(m_udp_fd, buffer, BUFFER_SIZE, 0, (sockaddr*)&peer, &peer_len);
             if (n <= 0) {
                 if (n < 0 && errno != EINTR && m_running) {
                     syslog(LOG_ERR, "Ошибка recvfrom: %s", strerror(errno));
                 }
-                if (n == 0) continue;  // keep-alive
+                if (n == 0) continue; // keep-alive
                 if (n < 0 && errno != EINTR) break;
                 continue;
             }
             if (n < (ssize_t)sizeof(struct iphdr)) continue;
 
             struct iphdr* ip = (struct iphdr*)buffer;
-            uint32_t src = ip->saddr;  // network byte order
+            uint32_t src = ip->saddr; // network byte order
 
             // Проверяем, что IP из подсети 192.168.200.0/24
             // network byte order: 192.168.200.X
@@ -194,8 +199,7 @@ class VPNServer {
                 if (it == m_clients.end()) {
                     char ip_str[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &src, ip_str, INET_ADDRSTRLEN);
-                    syslog(LOG_INFO, "Новый клиент: %s с %s:%d",
-                           ip_str, inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
+                    syslog(LOG_INFO, "Новый клиент: %s с %s:%d", ip_str, inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
                     m_clients[src] = {peer, std::chrono::steady_clock::now()};
                 } else {
                     it->second.addr = peer;
@@ -205,7 +209,7 @@ class VPNServer {
 
             ssize_t written = ::write(tun_fd, buffer, n);
             if (written > 0) {
-                m_packets_from_clients.fetch_add(1, std::memory_order_relaxed);
+                m_packets_from_clients.fetch_add(1);
             } else if (written < 0 && errno != EINTR && m_running) {
                 syslog(LOG_ERR, "Ошибка записи в TUN: %s", strerror(errno));
             }
@@ -221,8 +225,7 @@ class VPNServer {
             auto now = std::chrono::steady_clock::now();
             std::lock_guard<std::mutex> lk(m_clients_mutex);
             for (auto it = m_clients.begin(); it != m_clients.end();) {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                    now - it->second.last_seen);
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.last_seen);
                 if (elapsed.count() > 60) {
                     char ip_str[INET_ADDRSTRLEN];
                     inet_ntop(AF_INET, &it->first, ip_str, INET_ADDRSTRLEN);
@@ -239,7 +242,7 @@ class VPNServer {
 static VPNServer* g_server = nullptr;
 
 int main(int argc, char* argv[]) {
-    initSyslog("vpn-server", LOG_INFO);
+    Os().initSyslog("vpn-server", LOG_INFO);
     signal(SIGINT, [](int) {
         syslog(LOG_INFO, "Получен сигнал SIGINT");
         if (g_server) g_server->stop();
@@ -277,6 +280,6 @@ int main(int argc, char* argv[]) {
     }
     server.run();
 
-    closeSyslog();
+    Os().closeSyslog();
     return EXIT_SUCCESS;
 }

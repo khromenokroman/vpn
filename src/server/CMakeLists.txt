@@ -1,6 +1,10 @@
 set(APP_NAME vpn-server)
 
-add_executable(${APP_NAME} server.cpp)
+add_executable(${APP_NAME}
+        server.cpp
+        ../share/device.cpp
+        ../share/os.cpp
+)
 target_include_directories(${APP_NAME}
         PRIVATE
         ${CMAKE_SOURCE_DIR}/src
