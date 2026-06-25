@@ -158,8 +158,7 @@ class VPNClient {
             if (n < (ssize_t)sizeof(struct iphdr)) continue;
 
             struct iphdr* ip = (struct iphdr*)plain_buffer;
-            //@todo: надо фильтровать по сети
-            if (ip->daddr == inet_addr("192.168.200.1") || ip->daddr == inet_addr("192.168.200.2") || ip->daddr == inet_addr("192.168.200.3")) {
+            if ((ip->daddr & htonl(0xFFFFFF00)) == htonl(0xC0A8C800)) {
                 continue;
             }
 
