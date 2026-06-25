@@ -45,5 +45,3 @@ netfilter-persistent save
 
 echo ""
 echo "Готово. Клиенты должны подключаться к: $(hostname -I | awk '{print $1}'):$VPN_PORT"
-echo "На основном сервере разрешить входящий UDP с IP этого relay:"
-echo "  iptables -I INPUT -p udp -s $(hostname -I | awk '{print $1}') --dport $VPN_PORT -j ACCEPT"
