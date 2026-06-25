@@ -5,7 +5,7 @@
 #include <sys/syslog.h>
 
 #include <string>
-void Os::tuneUdpSocket(int fd, int size) {
+void Os::tune_udp_socket(int fd, int size) {
     if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, sizeof(size)) < 0) {
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
     }
@@ -18,13 +18,13 @@ void Os::tuneUdpSocket(int fd, int size) {
     getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &len);
     syslog(LOG_INFO, "UDP-сокет: SO_RCVBUF=%d, SO_SNDBUF=%d", actual_rcv, actual_snd);
 }
-void Os::setupClientRoutes(std::string_view tun_name) {
+void Os::setup_client_routes(std::string_view tun_name) {
     system("ip route del default");
     syslog(LOG_INFO, "Удален маршрут по умолчанию");
     system(::fmt::format("ip route add default via 192.168.200.1 dev {}", tun_name).c_str());
     syslog(LOG_INFO, "Маршрут по умолчанию установлен через %s", tun_name.data());
 }
-void Os::setupServerRoutes(std::string_view tun_name, std::string_view external_iface, std::size_t vpn_port) {
+void Os::setup_server_routes(std::string_view tun_name, std::string_view external_iface, std::size_t vpn_port) {
     system(::fmt::format("iptables -t nat -D POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
     system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
     system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
@@ -36,7 +36,7 @@ void Os::setupServerRoutes(std::string_view tun_name, std::string_view external_
     system("echo 1 > /proc/sys/net/ipv4/ip_forward");
     syslog(LOG_INFO, "Правила NAT настроены для %s через %s на порту %lu", tun_name.data(), external_iface.data(), vpn_port);
 }
-std::string Os::getDefaultInterface() {
+std::string Os::get_default_interface() {
     FILE* fp = popen("ip route | grep default | awk '{print $5}'", "r");
     if (!fp) return "";
     char buffer[256];
@@ -49,7 +49,7 @@ std::string Os::getDefaultInterface() {
     return "";
 }
 
-std::string Os::getDefaultGateway() {
+std::string Os::get_default_gateway() {
     FILE* fp = popen("ip route | grep default | awk '{print $3}'", "r");
     if (!fp) return "";
     char buffer[256];
@@ -61,9 +61,9 @@ std::string Os::getDefaultGateway() {
     pclose(fp);
     return "";
 }
-void Os::initSyslog(const char* ident, int log_level) {
+void Os::init_syslog(const char* ident, int log_level) {
     openlog(ident, LOG_PID, LOG_DAEMON);
     setlogmask(LOG_UPTO(log_level));
 }
 
-void Os::closeSyslog() { closelog(); };
+void Os::close_syslog() { closelog(); }

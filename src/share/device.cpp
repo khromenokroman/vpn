@@ -12,8 +12,8 @@
 
 TunDevice::TunDevice() : m_fd(-1) {}
 
-bool TunDevice::open(std::string_view name, std::string_view ip,std::size_t mtu) {
-    m_fd = createTunDevice(name, ip, mtu);
+bool TunDevice::open(std::string_view name, std::string_view ip, std::size_t mtu) {
+    m_fd = create_tun_device(name, ip, mtu);
     return m_fd >= 0;
 }
 
@@ -24,9 +24,9 @@ void TunDevice::close() {
     }
 }
 
-int TunDevice::getFd() const { return m_fd; }
-bool TunDevice::isOpen() const { return m_fd >= 0; }
-int TunDevice::createTunDevice(std::string_view name, std::string_view ip, std::size_t mtu) {
+int TunDevice::get_fd() const { return m_fd; }
+bool TunDevice::is_open() const { return m_fd >= 0; }
+int TunDevice::create_tun_device(std::string_view name, std::string_view ip, std::size_t mtu) {
     struct ifreq ifr;
     int fd;
 
