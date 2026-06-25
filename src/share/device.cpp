@@ -11,6 +11,7 @@
 #include <cstdlib>
 
 TunDevice::TunDevice() : m_fd(-1) {}
+TunDevice::~TunDevice() { close(); }
 
 bool TunDevice::open(std::string_view name, std::string_view ip, std::size_t mtu) {
     m_fd = create_tun_device(name, ip, mtu);
@@ -27,10 +28,9 @@ void TunDevice::close() {
 int TunDevice::get_fd() const { return m_fd; }
 bool TunDevice::is_open() const { return m_fd >= 0; }
 int TunDevice::create_tun_device(std::string_view name, std::string_view ip, std::size_t mtu) {
-    struct ifreq ifr;
-    int fd;
+    struct ifreq ifr{};
 
-    if ((fd = ::open(m_tun_device.data(), O_RDWR)) < 0) {
+    if ((m_fd = ::open(m_tun_device.data(), O_RDWR)) < 0) {
         syslog(LOG_ERR, "Не удалось открыть TUN-устройство: %s", strerror(errno));
         return -1;
     }
@@ -39,9 +39,9 @@ int TunDevice::create_tun_device(std::string_view name, std::string_view ip, std
     ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
     strncpy(ifr.ifr_name, name.data(), IFNAMSIZ);
 
-    if (ioctl(fd, TUNSETIFF, &ifr) < 0) {
+    if (ioctl(m_fd, TUNSETIFF, &ifr) < 0) {
         syslog(LOG_ERR, "Ошибка ioctl TUNSETIFF: %s", strerror(errno));
-        ::close(fd);
+        ::close(m_fd);
         return -1;
     }
 
@@ -51,5 +51,5 @@ int TunDevice::create_tun_device(std::string_view name, std::string_view ip, std
     system(::fmt::format("ip link set {} up 2>/dev/null", name).c_str());
     system("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null");
     syslog(LOG_INFO, "TUN-устройство %s создано с IP %s, MTU %zu", name.data(), ip.data(), mtu);
-    return fd;
+    return m_fd;
 }
