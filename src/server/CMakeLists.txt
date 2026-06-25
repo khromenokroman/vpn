@@ -1,6 +1,7 @@
 set(APP_NAME vpn-server)
 
 add_executable(${APP_NAME}
+        server.hpp
         server.cpp
         ../share/device.cpp
         ../share/os.cpp

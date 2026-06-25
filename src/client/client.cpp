@@ -46,8 +46,8 @@ class VPNClient {
         }
 
         // 2. Запоминаем интерфейс и шлюз ДО изменения маршрутов
-        std::string iface = Os().getDefaultInterface();
-        std::string gateway = Os().getDefaultGateway();
+        std::string iface = Os().get_default_interface();
+        std::string gateway = Os().get_default_gateway();
 
         // 3. Добавляем маршрут до сервера через реальный интерфейс
         if (!gateway.empty() && !iface.empty()) {
@@ -60,7 +60,7 @@ class VPNClient {
         }
 
         // 4. Маршрут по умолчанию через tun0
-        Os().setupClientRoutes();
+        Os().setup_client_routes();
 
         // 5. Создаём UDP-сокет
         m_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -79,7 +79,7 @@ class VPNClient {
         }
 
         // 7. Увеличиваем буферы UDP-сокета
-        Os().tuneUdpSocket(m_udp_fd);
+        Os().tune_udp_socket(m_udp_fd);
 
         // 8. Адрес сервера
         m_server_addr.sin_family = AF_INET;
@@ -97,10 +97,10 @@ class VPNClient {
         syslog(LOG_INFO, "Запуск VPN-клиента...");
 
         // Отправляем первый keep-alive, чтобы сервер узнал наш endpoint
-        sendKeepAlive();
+        send_keep_alive();
 
-        m_tun_to_udp_thread = std::thread([this]() { tunToUdpLoop(); });
-        m_udp_to_tun_thread = std::thread([this]() { udpToTunLoop(); });
+        m_tun_to_udp_thread = std::thread([this]() { tun_to_udp_loop(); });
+        m_udp_to_tun_thread = std::thread([this]() { udp_to_tun_loop(); });
 
         syslog(LOG_INFO, "VPN-клиент запущен");
 
@@ -112,7 +112,7 @@ class VPNClient {
             if (!m_running) break;
 
             // Keep-alive каждые 10 секунд
-            sendKeepAlive();
+            send_keep_alive();
 
             // Статистика каждые 30 секунд
             if (++counter % 3 == 0) {
@@ -140,10 +140,10 @@ class VPNClient {
 
    private:
     // Поток №1: TUN -> UDP
-    void tunToUdpLoop() {
+    void tun_to_udp_loop() {
         char plain_buffer[BUFFER_SIZE];
         char encrypted_buffer[BUFFER_SIZE + 128];
-        int tun_fd = m_tun.getFd();
+        int tun_fd = m_tun.get_fd();
 
         while (m_running) {
             ssize_t n = ::read(tun_fd, plain_buffer, BUFFER_SIZE);
@@ -178,10 +178,10 @@ class VPNClient {
     }
 
     // Поток №2: UDP -> TUN
-    void udpToTunLoop() {
+    void udp_to_tun_loop() {
         char encrypted_buffer[BUFFER_SIZE + 128];
         char plain_buffer[BUFFER_SIZE];
-        int tun_fd = m_tun.getFd();
+        int tun_fd = m_tun.get_fd();
 
         while (m_running) {
             ssize_t n = ::recv(m_udp_fd, encrypted_buffer, sizeof(encrypted_buffer), 0);
@@ -207,7 +207,7 @@ class VPNClient {
         }
     }
 
-    void sendKeepAlive() {
+    void send_keep_alive() {
         const char dummy = 0;
         ::sendto(m_udp_fd, &dummy, 0, 0, (sockaddr*)&m_server_addr, sizeof(m_server_addr));
     }
@@ -217,7 +217,7 @@ static VPNClient* g_client = nullptr;
 namespace po = boost::program_options;
 
 int main(int argc, char* argv[]) {
-    Os().initSyslog("vpn-client", LOG_INFO);
+    Os().init_syslog("vpn-client", LOG_INFO);
     signal(SIGINT, [](int) {
         syslog(LOG_INFO, "Получен сигнал SIGINT");
         if (g_client) g_client->stop();
@@ -292,6 +292,6 @@ int main(int argc, char* argv[]) {
     }
     client.run();
 
-    Os().closeSyslog();
+    Os().close_syslog();
     return EXIT_SUCCESS;
 }
