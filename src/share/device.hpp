@@ -4,6 +4,7 @@
 class TunDevice {
    public:
     TunDevice();
+    ~TunDevice();
 
     bool open(std::string_view name, std::string_view ip, size_t mtu);
     void close();
