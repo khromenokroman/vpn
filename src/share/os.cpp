@@ -28,11 +28,11 @@ void Os::setup_server_routes(std::string_view tun_name, std::string_view externa
     system(::fmt::format("iptables -t nat -D POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
     system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
     system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
-    system(::fmt::format("iptables -D INPUT -p tcp --dport {} -j ACCEPT", vpn_port).c_str());
+    system(::fmt::format("iptables -D INPUT -p udp --dport {} -j ACCEPT", vpn_port).c_str());
     system(::fmt::format("iptables -t nat -A POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
     system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
     system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
-    system(::fmt::format("iptables -I INPUT 1 -p tcp --dport {} -j ACCEPT", vpn_port).c_str());
+    system(::fmt::format("iptables -I INPUT 1 -p udp --dport {} -j ACCEPT", vpn_port).c_str());
     system("echo 1 > /proc/sys/net/ipv4/ip_forward");
     syslog(LOG_INFO, "Правила NAT настроены для %s через %s на порту %lu", tun_name.data(), external_iface.data(), vpn_port);
 }
