@@ -5,12 +5,14 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
 
 #include "share/crypto.hpp"
 #include "share/device.hpp"
+#include "share/routing.hpp"
 #include "share/signal_fd.hpp"
 #include "share/stop_event.hpp"
 
@@ -56,6 +58,8 @@ class VPNClient {
     void send_keep_alive();
     void log_stats();
 
+    std::unique_ptr<ClientRoutes> m_routes;
+
     std::thread m_tun_to_udp_thread;
     std::thread m_udp_to_tun_thread;
 
@@ -74,6 +78,7 @@ class VPNClient {
     std::uint64_t m_last_received = 0;
     std::size_t m_mtu;
 
+    std::uint32_t m_tun_ip_be = 0;
     int m_udp_fd = -1;
     std::uint16_t m_port;
     bool m_stopped = false;

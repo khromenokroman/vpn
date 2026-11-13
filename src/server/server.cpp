@@ -1,7 +1,6 @@
 #include "server.hpp"
 
 #include <arpa/inet.h>
-#include <linux/ip.h>
 #include <sys/socket.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -18,7 +17,8 @@
 
 #include "share/key_file.hpp"
 #include "share/log.hpp"
-#include "share/os.hpp"
+#include "share/net.hpp"
+#include "share/packet.hpp"
 #include "share/signal_fd.hpp"
 
 namespace {
@@ -33,30 +33,45 @@ constexpr auto STATS_INTERVAL = std::chrono::seconds(30);
 constexpr std::size_t CRYPTO_SLACK = 128;
 static_assert(CRYPTO_SLACK >= Crypto::overhead());
 
-std::string ip_to_string(std::uint32_t addr_be) {
-    char buf[INET_ADDRSTRLEN] = {};
-    ::inet_ntop(AF_INET, &addr_be, buf, sizeof(buf));
-    return buf;
-}
-
-std::string endpoint_to_string(const sockaddr_in& addr) { return fmt::format("{}:{}", ip_to_string(addr.sin_addr.s_addr), ntohs(addr.sin_port)); }
+std::string endpoint_to_string(const sockaddr_in& addr) { return fmt::format("{}:{}", ipv4_to_string(addr.sin_addr.s_addr), ntohs(addr.sin_port)); }
 
 } // namespace
 
-VPNServer::VPNServer(std::string_view tun_name, std::string_view tun_ip, std::uint16_t port, std::size_t mtu, std::string_view key)
-    : m_tun_name(tun_name), m_tun_ip(tun_ip), m_crypto{key}, m_mtu{mtu}, m_port(port) {}
+VPNServer::VPNServer(std::string_view tun_name, std::string_view tun_ip, std::string_view external_iface, std::uint16_t port, std::size_t mtu,
+                     std::string_view key)
+    : m_tun_name(tun_name), m_tun_ip(tun_ip), m_external_iface(external_iface), m_crypto{key}, m_mtu{mtu}, m_port(port) {}
 
 VPNServer::~VPNServer() { stop(); }
 
 bool VPNServer::init() {
-    m_external_iface = Os().get_default_interface();
+    auto tun_ip = parse_ipv4(m_tun_ip);
+    if (!tun_ip) {
+        log_msg(LOG_ERR, "Недопустимый IP TUN-интерфейса: {}", m_tun_ip);
+        return false;
+    }
+    m_tun_ip_be = *tun_ip;
+
+    if (m_external_iface.empty()) {
+        auto route = get_default_route();
+        if (!route) {
+            log_msg(LOG_ERR, "Нет маршрута по умолчанию, внешний интерфейс не определён: укажите --external-iface");
+            return false;
+        }
+        m_external_iface = route->iface;
+    }
 
     if (!m_tun.open(m_tun_name, m_tun_ip, m_mtu)) {
         log_msg(LOG_ERR, "Не удалось создать TUN-устройство");
         return false;
     }
 
-    Os().setup_server_routes(m_tun_name, m_external_iface, m_port);
+    if (!enable_ip_forward()) {
+        log_msg(LOG_WARNING, "Без net.ipv4.ip_forward клиентам доступен только сам сервер");
+    }
+    m_nat = std::make_unique<NatRules>(server_nat_rules(m_tun_name, m_external_iface, subnet24_cidr(m_tun_ip_be), m_port));
+    if (!m_nat->apply()) {
+        return false;
+    }
 
     m_udp_fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (m_udp_fd < 0) {
@@ -76,7 +91,7 @@ bool VPNServer::init() {
         return false;
     }
 
-    Os().tune_udp_socket(m_udp_fd);
+    tune_udp_socket(m_udp_fd);
 
     std::array<char, 256> hostname{};
     ::gethostname(hostname.data(), hostname.size() - 1);
@@ -142,6 +157,7 @@ void VPNServer::stop() noexcept {
         ::close(m_udp_fd);
         m_udp_fd = -1;
     }
+    if (m_nat) m_nat->remove();
     m_tun.close();
     log_msg(LOG_INFO, "VPN-сервер остановлен");
 }
@@ -165,15 +181,13 @@ void VPNServer::tun_to_udp_loop() {
             log_msg(LOG_ERR, "Ошибка чтения TUN: {}", errno_str(errno));
             break;
         }
-        if (n < static_cast<ssize_t>(sizeof(iphdr))) continue;
-
-        iphdr ip;
-        std::memcpy(&ip, plain_buffer.data(), sizeof(ip));
+        auto ip = parse_ipv4_packet(plain_buffer.data(), static_cast<std::size_t>(n));
+        if (!ip) continue;
 
         sockaddr_in client_addr{};
         {
             std::lock_guard<std::mutex> lk(m_clients_mutex);
-            auto it = m_clients.find(ip.daddr);
+            auto it = m_clients.find(ip->dst);
             if (it == m_clients.end()) continue;
             client_addr = it->second.addr;
         }
@@ -221,27 +235,20 @@ void VPNServer::udp_to_tun_loop() {
         if (!m_crypto.decrypt(encrypted_buffer.data(), static_cast<std::size_t>(n), plain_buffer.data(), plain_size)) {
             continue;
         }
-        if (plain_size < sizeof(iphdr)) continue;
-
-        iphdr ip;
-        std::memcpy(&ip, plain_buffer.data(), sizeof(ip));
-        const std::uint32_t src = ip.saddr;
-
-        // принимаются только адреса из 192.168.200.0/24
-        if ((src & htonl(0xFFFFFF00)) != htonl(0xC0A8C800)) {
+        if (is_control_packet(plain_buffer.data(), plain_size)) {
+            auto client_ip = parse_keep_alive(plain_buffer.data(), plain_size);
+            if (client_ip && *client_ip != m_tun_ip_be && same_subnet24(*client_ip, m_tun_ip_be)) {
+                touch_client(*client_ip, peer);
+            }
             continue;
         }
 
-        {
-            std::lock_guard<std::mutex> lk(m_clients_mutex);
-            auto [it, inserted] = m_clients.try_emplace(src, ClientInfo{std::chrono::steady_clock::now(), peer});
-            if (inserted) {
-                log_msg(LOG_INFO, "Новый клиент: {} с {}", ip_to_string(src), endpoint_to_string(peer));
-            } else {
-                it->second.addr = peer;
-                it->second.last_seen = std::chrono::steady_clock::now();
-            }
+        // только IPv4 от адресов подсети туннеля, кроме адреса самого сервера
+        auto ip = parse_ipv4_packet(plain_buffer.data(), plain_size);
+        if (!ip || ip->src == m_tun_ip_be || !same_subnet24(ip->src, m_tun_ip_be)) {
+            continue;
         }
+        touch_client(ip->src, peer);
 
         ssize_t written = ::write(tun_fd, plain_buffer.data(), plain_size);
         if (written >= 0) {
@@ -254,13 +261,27 @@ void VPNServer::udp_to_tun_loop() {
     m_stop.notify();
 }
 
+void VPNServer::touch_client(std::uint32_t tun_ip, const sockaddr_in& peer) {
+    std::lock_guard<std::mutex> lk(m_clients_mutex);
+    auto [it, inserted] = m_clients.try_emplace(tun_ip, ClientInfo{std::chrono::steady_clock::now(), peer});
+    if (inserted) {
+        log_msg(LOG_INFO, "Новый клиент: {} с {}", ipv4_to_string(tun_ip), endpoint_to_string(peer));
+        return;
+    }
+    if (it->second.addr.sin_addr.s_addr != peer.sin_addr.s_addr || it->second.addr.sin_port != peer.sin_port) {
+        log_msg(LOG_INFO, "Клиент {} сменил адрес: {} -> {}", ipv4_to_string(tun_ip), endpoint_to_string(it->second.addr), endpoint_to_string(peer));
+        it->second.addr = peer;
+    }
+    it->second.last_seen = std::chrono::steady_clock::now();
+}
+
 void VPNServer::cleanup_loop() {
     while (m_stop.wait_for(CLEANUP_INTERVAL) == StopEvent::Wait::TIMEOUT) {
         auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lk(m_clients_mutex);
         for (auto it = m_clients.begin(); it != m_clients.end();) {
             if (now - it->second.last_seen > CLIENT_TIMEOUT) {
-                log_msg(LOG_WARNING, "Удалён неактивный клиент: {}", ip_to_string(it->first));
+                log_msg(LOG_WARNING, "Удалён неактивный клиент: {}", ipv4_to_string(it->first));
                 it = m_clients.erase(it);
             } else {
                 ++it;
@@ -272,7 +293,7 @@ void VPNServer::cleanup_loop() {
 namespace po = boost::program_options;
 
 int main(int argc, char* argv[]) try {
-    Os().init_syslog("vpn-server", LOG_INFO);
+    init_syslog("vpn-server");
     // до создания потоков: маска наследуется, сигналы читаются только из signalfd
     SignalFd signals({SIGINT, SIGTERM});
     std::signal(SIGPIPE, SIG_IGN);
@@ -281,13 +302,15 @@ int main(int argc, char* argv[]) try {
     int mtu = 1420;
     std::string tun_name;
     std::string tun_ip;
+    std::string external_iface;
     std::string key_file;
 
     po::options_description desc("Параметры VPN-сервера", 200, 100);
     desc.add_options()("help,h", "показать справку")("port,p", po::value<int>(&port)->required(), "UDP-порт для прослушивания")(
         "mtu,m", po::value<int>(&mtu)->default_value(1420), "MTU TUN-интерфейса")(
         "tun-name,n", po::value<std::string>(&tun_name)->default_value("tun0"), "имя TUN-интерфейса")(
-        "tun-ip,i", po::value<std::string>(&tun_ip)->default_value("192.168.200.1"), "IP-адрес TUN-интерфейса")(
+        "tun-ip,i", po::value<std::string>(&tun_ip)->default_value("192.168.200.1"), "IP-адрес TUN-интерфейса, подсеть клиентов - его /24")(
+        "external-iface,e", po::value<std::string>(&external_iface), "внешний интерфейс для NAT; без параметра - интерфейс маршрута по умолчанию")(
         "key-file,k", po::value<std::string>(&key_file),
         "файл общего ключа (владелец root, права 0600); без параметра - $CREDENTIALS_DIRECTORY/vpn-key")("version,V", "показать версию");
 
@@ -317,6 +340,18 @@ int main(int argc, char* argv[]) try {
         report_error("Недопустимый MTU: {}", mtu);
         return EXIT_FAILURE;
     }
+    if (!is_valid_ifname(tun_name)) {
+        report_error("Недопустимое имя TUN-интерфейса: \"{}\"", tun_name);
+        return EXIT_FAILURE;
+    }
+    if (!external_iface.empty() && !is_valid_ifname(external_iface)) {
+        report_error("Недопустимое имя внешнего интерфейса: \"{}\"", external_iface);
+        return EXIT_FAILURE;
+    }
+    if (!parse_ipv4(tun_ip)) {
+        report_error("Недопустимый IP TUN-интерфейса: \"{}\"", tun_ip);
+        return EXIT_FAILURE;
+    }
     if (::geteuid() != 0) {
         report_error("Сервер должен быть запущен от имени root");
         return EXIT_FAILURE;
@@ -336,7 +371,7 @@ int main(int argc, char* argv[]) try {
 
     log_msg(LOG_INFO, "Запуск VPN-сервера {}: port={}, mtu={}, tun={}/{}", POMA_VPN_VERSION, port, mtu, tun_name, tun_ip);
 
-    VPNServer server(tun_name, tun_ip, static_cast<std::uint16_t>(port), static_cast<std::size_t>(mtu), key.view());
+    VPNServer server(tun_name, tun_ip, external_iface, static_cast<std::uint16_t>(port), static_cast<std::size_t>(mtu), key.view());
     key = SecretBuffer(1);
 
     if (!server.init()) {
@@ -345,7 +380,7 @@ int main(int argc, char* argv[]) try {
     }
     bool by_signal = server.run(signals);
     server.stop();
-    Os().close_syslog();
+    closelog();
     return by_signal ? EXIT_SUCCESS : EXIT_FAILURE;
 } catch (const std::exception& e) {
     report_error("Аварийное завершение: {}", e.what());

@@ -1,7 +1,6 @@
 #include "client.hpp"
 
 #include <arpa/inet.h>
-#include <linux/ip.h>
 #include <sys/socket.h>
 #include <syslog.h>
 #include <unistd.h>
@@ -19,7 +18,8 @@
 
 #include "share/key_file.hpp"
 #include "share/log.hpp"
-#include "share/os.hpp"
+#include "share/net.hpp"
+#include "share/packet.hpp"
 
 namespace {
 
@@ -40,26 +40,42 @@ VPNClient::VPNClient(std::string_view server_ip, std::uint16_t port, std::size_t
 VPNClient::~VPNClient() { stop(); }
 
 bool VPNClient::init() {
+    auto tun_ip = parse_ipv4(m_tun_ip);
+    if (!tun_ip) {
+        log_msg(LOG_ERR, "Недопустимый IP TUN-интерфейса: {}", m_tun_ip);
+        return false;
+    }
+    m_tun_ip_be = *tun_ip;
+
+    m_server_addr.sin_family = AF_INET;
+    m_server_addr.sin_port = htons(m_port);
+    if (::inet_pton(AF_INET, m_server_ip.c_str(), &m_server_addr.sin_addr) != 1) {
+        log_msg(LOG_ERR, "Недопустимый IP сервера: {}", m_server_ip);
+        return false;
+    }
+
+    // запоминается до смены маршрутов: через него идёт сам туннель
+    auto route = get_default_route();
+    if (!route) {
+        log_msg(LOG_ERR, "Нет маршрута по умолчанию: непонятно, через какой интерфейс идти к серверу");
+        return false;
+    }
+    if (route->iface == m_tun_name) {
+        log_msg(LOG_ERR, "Маршрут по умолчанию уже идёт через {}: запущен второй клиент?", m_tun_name);
+        return false;
+    }
+
     if (!m_tun.open(m_tun_name, m_tun_ip, m_mtu)) {
         log_msg(LOG_ERR, "Не удалось создать TUN-устройство");
         return false;
     }
 
-    // интерфейс и шлюз запоминаются до смены маршрута по умолчанию
-    std::string iface = Os().get_default_interface();
-    std::string gateway = Os().get_default_gateway();
-
-    // маршрут до сервера через реальный интерфейс, чтобы сам туннель не шёл в туннель
-    if (!gateway.empty() && !iface.empty()) {
-        std::string cmd = "ip route add " + m_server_ip + " via " + gateway + " dev " + iface + " 2>/dev/null";
-        if (std::system(cmd.c_str()) != 0) {
-            log_msg(LOG_WARNING, "Не удалось добавить маршрут до сервера");
-        } else {
-            log_msg(LOG_INFO, "Маршрут до сервера {} через {} dev {}", m_server_ip, gateway, iface);
-        }
+    m_routes = std::make_unique<ClientRoutes>(m_server_ip, *route, m_tun_name);
+    if (!m_routes->apply()) {
+        log_msg(LOG_ERR, "Не удалось настроить маршруты");
+        return false;
     }
-
-    Os().setup_client_routes(m_tun_name);
+    const std::string iface = route->iface;
 
     m_udp_fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
     if (m_udp_fd < 0) {
@@ -75,14 +91,7 @@ bool VPNClient::init() {
         }
     }
 
-    Os().tune_udp_socket(m_udp_fd);
-
-    m_server_addr.sin_family = AF_INET;
-    m_server_addr.sin_port = htons(m_port);
-    if (::inet_pton(AF_INET, m_server_ip.c_str(), &m_server_addr.sin_addr) != 1) {
-        log_msg(LOG_ERR, "Недопустимый IP сервера: {}", m_server_ip);
-        return false;
-    }
+    tune_udp_socket(m_udp_fd);
 
     log_msg(LOG_INFO, "VPN-клиент инициализирован, сервер {}:{}", m_server_ip, m_port);
     return true;
@@ -141,6 +150,8 @@ void VPNClient::stop() noexcept {
         ::close(m_udp_fd);
         m_udp_fd = -1;
     }
+    // маршруты до закрытия TUN: удаление маршрута до сервера не зависит от интерфейса
+    if (m_routes) m_routes->remove();
     m_tun.close();
     log_msg(LOG_INFO, "VPN-клиент остановлен");
 }
@@ -149,9 +160,6 @@ void VPNClient::tun_to_udp_loop() {
     std::array<char, BUFFER_SIZE> plain_buffer;
     std::array<char, BUFFER_SIZE + CRYPTO_SLACK> encrypted_buffer;
     const int tun_fd = m_tun.get_fd();
-    const std::uint32_t skip1 = ::inet_addr("192.168.200.1");
-    const std::uint32_t skip2 = ::inet_addr("192.168.200.2");
-    const std::uint32_t skip3 = ::inet_addr("192.168.200.3");
 
     for (;;) {
         StopEvent::Wait w = m_stop.wait_readable(tun_fd);
@@ -167,14 +175,8 @@ void VPNClient::tun_to_udp_loop() {
             log_msg(LOG_ERR, "Ошибка чтения TUN: {}", errno_str(errno));
             break;
         }
-        if (n < static_cast<ssize_t>(sizeof(iphdr))) continue;
-
-        iphdr ip;
-        std::memcpy(&ip, plain_buffer.data(), sizeof(ip));
-        //@todo: надо фильтровать по сети
-        if (ip.daddr == skip1 || ip.daddr == skip2 || ip.daddr == skip3) {
-            continue;
-        }
+        // IPv6 и мусор в туннель не отправляются: сервер их всё равно отбросит
+        if (!parse_ipv4_packet(plain_buffer.data(), static_cast<std::size_t>(n))) continue;
 
         std::size_t encrypted_size = 0;
         if (!m_crypto.encrypt(plain_buffer.data(), static_cast<std::size_t>(n), encrypted_buffer.data(), encrypted_size)) {
@@ -218,6 +220,8 @@ void VPNClient::udp_to_tun_loop() {
             continue;
         }
 
+        if (!parse_ipv4_packet(plain_buffer.data(), plain_size)) continue;
+
         ssize_t written = ::write(tun_fd, plain_buffer.data(), plain_size);
         if (written >= 0) {
             m_packets_received.fetch_add(1, std::memory_order_relaxed);
@@ -229,14 +233,21 @@ void VPNClient::udp_to_tun_loop() {
 }
 
 void VPNClient::send_keep_alive() {
-    const char dummy = 0;
-    ::sendto(m_udp_fd, &dummy, 0, 0, reinterpret_cast<const sockaddr*>(&m_server_addr), sizeof(m_server_addr));
+    // зашифрованный служебный пакет с адресом клиента: по нему сервер обновляет адрес клиента за NAT
+    auto plain = make_keep_alive(m_tun_ip_be);
+    std::array<char, KEEP_ALIVE_SIZE + Crypto::overhead()> sealed;
+    std::size_t sealed_size = 0;
+    if (!m_crypto.encrypt(plain.data(), plain.size(), sealed.data(), sealed_size)) return;
+    if (::sendto(m_udp_fd, sealed.data(), sealed_size, 0, reinterpret_cast<const sockaddr*>(&m_server_addr), sizeof(m_server_addr)) < 0 &&
+        errno != ECONNREFUSED) {
+        log_msg(LOG_WARNING, "Не удалось отправить keep-alive: {}", errno_str(errno));
+    }
 }
 
 namespace po = boost::program_options;
 
 int main(int argc, char* argv[]) try {
-    Os().init_syslog("vpn-client", LOG_INFO);
+    init_syslog("vpn-client");
     // до создания потоков: маска наследуется, сигналы читаются только из signalfd
     SignalFd signals({SIGINT, SIGTERM});
     std::signal(SIGPIPE, SIG_IGN);
@@ -283,6 +294,18 @@ int main(int argc, char* argv[]) try {
         report_error("Недопустимый MTU: {}", mtu);
         return EXIT_FAILURE;
     }
+    if (!parse_ipv4(server_ip)) {
+        report_error("Недопустимый IP сервера: \"{}\", нужен IPv4-адрес", server_ip);
+        return EXIT_FAILURE;
+    }
+    if (!is_valid_ifname(tun_name)) {
+        report_error("Недопустимое имя TUN-интерфейса: \"{}\"", tun_name);
+        return EXIT_FAILURE;
+    }
+    if (!parse_ipv4(tun_ip)) {
+        report_error("Недопустимый IP TUN-интерфейса: \"{}\"", tun_ip);
+        return EXIT_FAILURE;
+    }
     if (::geteuid() != 0) {
         report_error("Клиент должен быть запущен от имени root");
         return EXIT_FAILURE;
@@ -311,7 +334,7 @@ int main(int argc, char* argv[]) try {
     }
     bool by_signal = client.run(signals);
     client.stop();
-    Os().close_syslog();
+    closelog();
     return by_signal ? EXIT_SUCCESS : EXIT_FAILURE;
 } catch (const std::exception& e) {
     report_error("Аварийное завершение: {}", e.what());

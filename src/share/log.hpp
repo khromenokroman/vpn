@@ -40,3 +40,9 @@ void report_error(fmt::format_string<Args...> format, Args&&... args) {
     std::fprintf(stderr, "%s\n", msg.c_str());
     syslog(LOG_ERR, "%s", msg.c_str());
 }
+
+/**
+ * @brief Открывает syslog для программы.
+ * @param ident имя в журнале (journalctl -t <ident>)
+ */
+inline void init_syslog(const char* ident) { openlog(ident, LOG_PID, LOG_DAEMON); }
