@@ -54,7 +54,7 @@ bool VPNServer::init() {
     if (m_external_iface.empty()) {
         auto route = get_default_route();
         if (!route) {
-            log_msg(LOG_ERR, "Нет маршрута по умолчанию, внешний интерфейс для NAT не определён");
+            log_msg(LOG_ERR, "Нет маршрута по умолчанию, внешний интерфейс не определён: укажите --external-iface");
             return false;
         }
         m_external_iface = route->iface;
@@ -310,6 +310,7 @@ int main(int argc, char* argv[]) try {
         "mtu,m", po::value<int>(&mtu)->default_value(1420), "MTU TUN-интерфейса")(
         "tun-name,n", po::value<std::string>(&tun_name)->default_value("tun0"), "имя TUN-интерфейса")(
         "tun-ip,i", po::value<std::string>(&tun_ip)->default_value("192.168.200.1"), "IP-адрес TUN-интерфейса, подсеть клиентов - его /24")(
+        "external-iface,e", po::value<std::string>(&external_iface), "внешний интерфейс для NAT; без параметра - интерфейс маршрута по умолчанию")(
         "key-file,k", po::value<std::string>(&key_file),
         "файл общего ключа (владелец root, права 0600); без параметра - $CREDENTIALS_DIRECTORY/vpn-key")("version,V", "показать версию");
 
@@ -341,6 +342,10 @@ int main(int argc, char* argv[]) try {
     }
     if (!is_valid_ifname(tun_name)) {
         report_error("Недопустимое имя TUN-интерфейса: \"{}\"", tun_name);
+        return EXIT_FAILURE;
+    }
+    if (!external_iface.empty() && !is_valid_ifname(external_iface)) {
+        report_error("Недопустимое имя внешнего интерфейса: \"{}\"", external_iface);
         return EXIT_FAILURE;
     }
     if (!parse_ipv4(tun_ip)) {
