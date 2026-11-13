@@ -1,0 +1,127 @@
+name: Build DEB
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: build-${{ matrix.distro }}
+    runs-on: ubuntu-24.04
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian12
+            image: debian:bookworm
+          - distro: debian13
+            image: debian:trixie
+
+    steps:
+      - name: Install dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git build-essential cmake pkg-config dpkg-dev file \
+            libboost-program-options-dev libsodium-dev libfmt-dev libgtest-dev libgmock-dev
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Check tag matches version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          VERSION=$(sed -n 's/^ *VERSION \([0-9.]*\)$/\1/p' CMakeLists.txt | head -1)
+          if [ "${GITHUB_REF_NAME}" != "v${VERSION}" ]; then
+            echo "Тег ${GITHUB_REF_NAME} не совпадает с версией v${VERSION} в CMakeLists.txt"
+            exit 1
+          fi
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+
+      - name: Build
+        run: cmake --build build -j "$(nproc)"
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Smoke run
+        run: |
+          ./build/vpn-server --version
+          ./build/vpn-client --version
+          ./build/vpn-server --help | grep -q -- --key-file
+          ./build/vpn-client --help | grep -q -- --server
+
+      - name: Package DEB
+        working-directory: build
+        run: |
+          cpack -G DEB
+          for f in *.deb; do mv "$f" "${f%.deb}-${{ matrix.distro }}.deb"; done
+          for f in *.deb; do dpkg-deb -I "$f"; dpkg-deb -c "$f"; done
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: poma-vpn-${{ matrix.distro }}
+          path: build/*.deb
+          retention-days: 7
+
+  install:
+    name: install-${{ matrix.distro }}
+    needs: build
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian12
+            codename: bookworm
+          - distro: debian13
+            codename: trixie
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Download DEB
+        uses: actions/download-artifact@v8
+        with:
+          name: poma-vpn-${{ matrix.distro }}
+          path: deb
+
+      - name: Install, upgrade and remove with systemd
+        run: tests/deb_install.sh deb ${{ matrix.codename }}
+
+      - name: Tunnel between containers
+        run: |
+          sudo modprobe tun
+          tests/e2e.sh deb ${{ matrix.codename }}
+
+  release:
+    needs: [ build, install ]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: poma-vpn-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Create release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: poma-vpn ${{ github.ref_name }}
+          files: artifacts/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: true
