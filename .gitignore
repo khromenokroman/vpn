@@ -1,0 +1,7 @@
+.idea
+.claude
+CLAUDE.md
+AGENTS.md
+cmake-build-*
+build
+compile_commands.json
