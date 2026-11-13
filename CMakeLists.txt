@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.25.1)
 project(poma-vpn
-        VERSION 0.2.0.0
+        VERSION 0.2.1.0
         LANGUAGES CXX
         HOMEPAGE_URL "https://github.com/khromenokroman/vpn")
 
@@ -23,6 +23,8 @@ add_library(vpn_share STATIC
         src/share/crypto.cpp
         src/share/device.cpp
         src/share/key_file.cpp
+        src/share/signal_fd.cpp
+        src/share/stop_event.cpp
         src/share/os.cpp
 )
 target_include_directories(vpn_share PUBLIC src)
@@ -47,6 +49,7 @@ if (BUILD_TESTS)
     add_executable(vpn_tests
             tests/test_crypto.cpp
             tests/test_key_file.cpp
+            tests/test_stop_event.cpp
     )
     target_link_libraries(vpn_tests PRIVATE vpn_share GTest::gtest_main GTest::gmock)
     add_test(NAME vpn_tests COMMAND vpn_tests)
