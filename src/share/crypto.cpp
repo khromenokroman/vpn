@@ -2,19 +2,15 @@
 
 #include <cstring>
 
-constexpr unsigned char Crypto::MAGIC[4];
-
-Crypto::Crypto(std::string_view password) {
-    crypto_generichash(m_key,
-                       sizeof(m_key),
-                       reinterpret_cast<const unsigned char*>(password.data()),
-                       password.size(),
-                       nullptr,
-                       0);
+Crypto::Crypto(std::string_view secret) {
+    // без mlock ключ может попасть в своп; не критично для работы, поэтому только попытка
+    sodium_mlock(m_key, sizeof(m_key));
+    crypto_generichash(m_key, sizeof(m_key), reinterpret_cast<const unsigned char*>(secret.data()), secret.size(), nullptr, 0);
 }
 
-constexpr std::size_t Crypto::overhead() {
-    return HEADER_SIZE + TAG_SIZE;
+Crypto::~Crypto() {
+    // sodium_munlock затирает память перед снятием блокировки
+    sodium_munlock(m_key, sizeof(m_key));
 }
 
 bool Crypto::encrypt(const char* plain, std::size_t plain_size, char* out, std::size_t& out_size) {
@@ -28,16 +24,8 @@ bool Crypto::encrypt(const char* plain, std::size_t plain_size, char* out, std::
 
     unsigned long long cipher_len = 0;
 
-    int rc = crypto_aead_xchacha20poly1305_ietf_encrypt(
-        reinterpret_cast<unsigned char*>(out + HEADER_SIZE),
-        &cipher_len,
-        reinterpret_cast<const unsigned char*>(plain),
-        plain_size,
-        nullptr,
-        0,
-        nullptr,
-        nonce,
-        m_key);
+    int rc = crypto_aead_xchacha20poly1305_ietf_encrypt(reinterpret_cast<unsigned char*>(out + HEADER_SIZE), &cipher_len,
+                                                        reinterpret_cast<const unsigned char*>(plain), plain_size, nullptr, 0, nullptr, nonce, m_key);
 
     if (rc != 0) return false;
 
@@ -60,16 +48,8 @@ bool Crypto::decrypt(const char* encrypted, std::size_t encrypted_size, char* ou
 
     unsigned long long plain_len = 0;
 
-    int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(
-        reinterpret_cast<unsigned char*>(out),
-        &plain_len,
-        nullptr,
-        cipher,
-        cipher_size,
-        nullptr,
-        0,
-        nonce,
-        m_key);
+    int rc = crypto_aead_xchacha20poly1305_ietf_decrypt(reinterpret_cast<unsigned char*>(out), &plain_len, nullptr, cipher, cipher_size, nullptr, 0,
+                                                        nonce, m_key);
 
     if (rc != 0) {
         return false;

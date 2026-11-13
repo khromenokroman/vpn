@@ -6,12 +6,16 @@
 #include <atomic>
 #include <boost/program_options.hpp>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
+#include <optional>
 #include <thread>
 
 #include "../share/crypto.hpp"
 #include "../share/device.hpp"
+#include "../share/key_file.hpp"
 #include "../share/os.hpp"
 
 class VPNClient {
@@ -230,30 +234,21 @@ int main(int argc, char* argv[]) {
     });
     signal(SIGPIPE, SIG_IGN);
 
-    if (geteuid() != 0) {
-        syslog(LOG_ERR, "Клиент должен быть запущен от имени root");
-        return EXIT_FAILURE;
-    }
-
-    if (sodium_init() < 0) {
-        syslog(LOG_ERR, "Не удалось инициализировать libsodium");
-        return EXIT_FAILURE;
-    }
-
     std::string server_ip;
     int port = 0;
     int mtu = 1420;
     std::string tun_name;
     std::string tun_ip;
-    std::string key;
+    std::string key_file;
 
-    po::options_description desc("Параметры VPN-клиента");
+    po::options_description desc("Параметры VPN-клиента", 200, 100);
     desc.add_options()("help,h", "показать справку")("server,s", po::value<std::string>(&server_ip)->required(), "IP-адрес VPN-сервера")(
         "port,p", po::value<int>(&port)->required(), "UDP-порт VPN-сервера")("mtu,m", po::value<int>(&mtu)->default_value(1420),
                                                                              "MTU TUN-интерфейса")(
         "tun-name,n", po::value<std::string>(&tun_name)->default_value("tun0"), "имя TUN-интерфейса")(
         "tun-ip,i", po::value<std::string>(&tun_ip)->default_value("192.168.200.2"), "IP-адрес TUN-интерфейса")(
-        "key,k", po::value<std::string>(&key)->required(), "общий ключ шифрования");
+        "key-file,k", po::value<std::string>(&key_file),
+        "файл общего ключа (владелец root, права 0600); без параметра - $CREDENTIALS_DIRECTORY/vpn-key")("version,V", "показать версию");
 
     po::variables_map vm;
     try {
@@ -261,6 +256,10 @@ int main(int argc, char* argv[]) {
 
         if (vm.count("help")) {
             std::cout << desc << std::endl;
+            return EXIT_SUCCESS;
+        }
+        if (vm.count("version")) {
+            std::cout << POMA_VPN_VERSION << std::endl;
             return EXIT_SUCCESS;
         }
 
@@ -281,9 +280,31 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
+    if (geteuid() != 0) {
+        std::cerr << "Клиент должен быть запущен от имени root" << std::endl;
+        syslog(LOG_ERR, "Клиент должен быть запущен от имени root");
+        return EXIT_FAILURE;
+    }
+    if (sodium_init() < 0) {
+        std::cerr << "Не удалось инициализировать libsodium" << std::endl;
+        syslog(LOG_ERR, "Не удалось инициализировать libsodium");
+        return EXIT_FAILURE;
+    }
+
+    std::optional<std::filesystem::path> key_path_arg;
+    if (!key_file.empty()) key_path_arg = key_file;
+    SecretBuffer key(1);
+    try {
+        key = read_key_file(resolve_key_path(key_path_arg, std::getenv("CREDENTIALS_DIRECTORY")));
+    } catch (const KeyFileError& e) {
+        std::cerr << e.what() << std::endl;
+        syslog(LOG_ERR, "%s", e.what());
+        return EXIT_FAILURE;
+    }
+
     syslog(LOG_INFO, "Запуск VPN-клиента: server=%s:%d, mtu=%d, tun=%s/%s", server_ip.c_str(), port, mtu, tun_name.c_str(), tun_ip.c_str());
 
-    VPNClient client(server_ip, port, mtu, tun_name, tun_ip, key);
+    VPNClient client(server_ip, port, mtu, tun_name, tun_ip, key.view());
     g_client = &client;
 
     if (!client.init()) {
