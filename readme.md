@@ -199,3 +199,7 @@ tests/e2e.sh build trixie             # туннель между контейн
 journalctl -u poma-vpn-server -f
 journalctl -u poma-vpn-client -f
 ```
+
+## Лицензия
+
+GPL-3.0 или более поздняя версия, текст в [LICENSE](LICENSE).
