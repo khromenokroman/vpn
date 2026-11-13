@@ -3,6 +3,8 @@
 #include <fmt/format.h>
 #include <syslog.h>
 
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <string>
 #include <system_error>
@@ -46,3 +48,36 @@ void report_error(fmt::format_string<Args...> format, Args&&... args) {
  * @param ident имя в журнале (journalctl -t <ident>)
  */
 inline void init_syslog(const char* ident) { openlog(ident, LOG_PID, LOG_DAEMON); }
+
+/**
+ * @brief Ограничение частоты одного вида сообщений: поток одинаковых отказов не забивает журнал.
+ *
+ * Не потокобезопасен: у каждого потока свой экземпляр.
+ */
+class LogThrottle {
+   public:
+    /** @param interval не чаще одного сообщения за этот интервал */
+    explicit LogThrottle(std::chrono::seconds interval) : m_interval(interval) {}
+
+    /** @return true, если сообщение можно писать сейчас; пропущенные с прошлого раза считаются в suppressed() */
+    bool allow() {
+        auto now = std::chrono::steady_clock::now();
+        if (now < m_next) {
+            ++m_suppressed;
+            return false;
+        }
+        m_next = now + m_interval;
+        m_last_suppressed = m_suppressed;
+        m_suppressed = 0;
+        return true;
+    }
+
+    /** @brief Сколько сообщений пропущено перед последним разрешённым. */
+    std::uint64_t suppressed() const { return m_last_suppressed; }
+
+   private:
+    std::chrono::steady_clock::time_point m_next{};
+    std::chrono::seconds m_interval;
+    std::uint64_t m_suppressed = 0;
+    std::uint64_t m_last_suppressed = 0;
+};

@@ -126,17 +126,26 @@ TEST(Packet, ParseIpv4) {
 }
 
 /**
- * @brief Keep-alive: туда и обратно с адресом клиента; это служебный пакет, а не IPv4,
- * и он короче заголовка IPv4 (старый сервер его отбросит, а не запишет в TUN).
+ * @brief Keep-alive: туда и обратно с адресом и временем отправителя (в том числе отрицательным
+ * и с установленным старшим байтом), это служебный пакет, а не IPv4, и он короче заголовка IPv4.
  */
 TEST(Packet, KeepAlive) {
-    auto ka = make_keep_alive(ip("192.168.200.5"));
-    EXPECT_TRUE(is_control_packet(ka.data(), ka.size()));
-    EXPECT_FALSE(parse_ipv4_packet(ka.data(), ka.size()));
-    EXPECT_LT(ka.size(), IPV4_HEADER_MIN);
-    EXPECT_EQ(parse_keep_alive(ka.data(), ka.size()), ip("192.168.200.5"));
+    for (std::int64_t t : {std::int64_t{1763060000123456789}, std::int64_t{0}, std::int64_t{-1}, std::int64_t{0x7F00000000000001}}) {
+        SCOPED_TRACE("time_ns=" + std::to_string(t));
+        auto ka = make_keep_alive(ip("192.168.200.5"), t);
+        EXPECT_TRUE(is_control_packet(ka.data(), ka.size()));
+        EXPECT_FALSE(parse_ipv4_packet(ka.data(), ka.size()));
+        EXPECT_LT(ka.size(), IPV4_HEADER_MIN);
+        auto parsed = parse_keep_alive(ka.data(), ka.size());
+        ASSERT_TRUE(parsed);
+        EXPECT_EQ(parsed->tun_ip, ip("192.168.200.5"));
+        EXPECT_EQ(parsed->time_ns, t);
+    }
 
+    auto ka = make_keep_alive(ip("192.168.200.5"), 1);
+    EXPECT_EQ(static_cast<unsigned char>(ka[15]), 1) << "время big-endian: младший байт последний";
     EXPECT_FALSE(parse_keep_alive(ka.data(), ka.size() - 1)) << "обрезан";
+    EXPECT_FALSE(parse_keep_alive(ka.data(), 8)) << "keep-alive до 0.5.0.0 (8 байт, без времени)";
     auto other_type = ka;
     other_type[1] = 0x02;
     EXPECT_FALSE(parse_keep_alive(other_type.data(), other_type.size())) << "неизвестный тип 0x02";

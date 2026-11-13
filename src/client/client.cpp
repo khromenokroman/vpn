@@ -25,6 +25,8 @@ namespace {
 
 /** @brief Период keep-alive: сервер забывает клиента через 60 с тишины. */
 constexpr auto KEEP_ALIVE_INTERVAL = std::chrono::seconds(10);
+/** @brief Без ответа сервера столько времени клиент пишет в журнал, что сервер не отвечает. */
+constexpr auto SERVER_SILENCE = std::chrono::seconds(35);
 /** @brief Статистика пишется каждый N-й keep-alive. */
 constexpr unsigned STATS_EVERY = 3;
 /** @brief Запас буфера шифротекста сверх BUFFER_SIZE, не меньше Crypto::overhead(). */
@@ -35,7 +37,7 @@ static_assert(CRYPTO_SLACK >= Crypto::overhead());
 
 VPNClient::VPNClient(std::string_view server_ip, std::uint16_t port, std::size_t mtu, std::string_view tun_name, std::string_view tun_ip,
                      std::string_view key)
-    : m_tun_name{tun_name}, m_tun_ip{tun_ip}, m_server_ip{server_ip}, m_crypto{key}, m_mtu{mtu}, m_port{port} {}
+    : m_tun_name{tun_name}, m_tun_ip{tun_ip}, m_server_ip{server_ip}, m_crypto{key, Direction::CLIENT_TO_SERVER}, m_mtu{mtu}, m_port{port} {}
 
 VPNClient::~VPNClient() { stop(); }
 
@@ -99,6 +101,8 @@ bool VPNClient::init() {
 
 bool VPNClient::run(const SignalFd& signals) {
     log_msg(LOG_INFO, "Запуск VPN-клиента...");
+    // отсчёт молчания сервера идёт с запуска
+    m_server_seen_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
     send_keep_alive();
 
     m_tun_to_udp_thread = std::thread([this]() { tun_to_udp_loop(); });
@@ -121,6 +125,7 @@ bool VPNClient::run(const SignalFd& signals) {
                 return false;
             case StopEvent::Wait::TIMEOUT:
                 send_keep_alive();
+                check_server_alive();
                 if (++ticks % STATS_EVERY == 0) log_stats();
                 next_tick += KEEP_ALIVE_INTERVAL;
                 break;
@@ -134,7 +139,8 @@ bool VPNClient::run(const SignalFd& signals) {
 void VPNClient::log_stats() {
     std::uint64_t s = m_packets_sent.load(std::memory_order_relaxed);
     std::uint64_t r = m_packets_received.load(std::memory_order_relaxed);
-    log_msg(LOG_DEBUG, "Статистика: отправлено={} (+{}), получено={} (+{})", s, s - m_last_sent, r, r - m_last_received);
+    log_msg(LOG_DEBUG, "Статистика: отправлено={} (+{}), получено={} (+{}), отброшено повторов и чужих сессий={}", s, s - m_last_sent, r,
+            r - m_last_received, m_rejected.load(std::memory_order_relaxed));
     m_last_sent = s;
     m_last_received = r;
 }
@@ -179,7 +185,7 @@ void VPNClient::tun_to_udp_loop() {
         if (!parse_ipv4_packet(plain_buffer.data(), static_cast<std::size_t>(n))) continue;
 
         std::size_t encrypted_size = 0;
-        if (!m_crypto.encrypt(plain_buffer.data(), static_cast<std::size_t>(n), encrypted_buffer.data(), encrypted_size)) {
+        if (!m_crypto.seal(m_tx.next(), plain_buffer.data(), static_cast<std::size_t>(n), encrypted_buffer.data(), encrypted_size)) {
             continue;
         }
 
@@ -216,7 +222,30 @@ void VPNClient::udp_to_tun_loop() {
         }
 
         std::size_t plain_size = 0;
-        if (!m_crypto.decrypt(encrypted_buffer.data(), static_cast<std::size_t>(n), plain_buffer.data(), plain_size)) {
+        PacketHeader header{};
+        Crypto::Open opened = m_crypto.open(encrypted_buffer.data(), static_cast<std::size_t>(n), plain_buffer.data(), plain_size, header);
+        if (opened == Crypto::Open::OLD_PROTOCOL && m_old_protocol_log.allow()) {
+            log_msg(LOG_WARNING, "Сервер отвечает в старом формате (до 0.5.0.0): обновите сервер");
+        }
+        if (opened != Crypto::Open::OK) continue;
+
+        std::optional<KeepAlive> ka;
+        if (is_control_packet(plain_buffer.data(), plain_size)) {
+            ka = parse_keep_alive(plain_buffer.data(), plain_size);
+            if (!ka) continue;
+        }
+        bool had_session = m_server.has_session();
+        PeerState::Verdict v = m_server.check(header, ka ? std::optional(ka->time_ns) : std::nullopt, wall_clock_ns());
+        if (!PeerState::accepted(v)) {
+            m_rejected.fetch_add(1, std::memory_order_relaxed);
+            log_rejected(v, ka);
+            continue;
+        }
+        if (v == PeerState::Verdict::NEW_SESSION) {
+            log_msg(LOG_INFO, "{}", had_session ? "Сервер перезапущен, туннель восстановлен" : "Сервер ответил, туннель установлен");
+        }
+        if (ka) {
+            m_server_seen_ns.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
             continue;
         }
 
@@ -234,13 +263,36 @@ void VPNClient::udp_to_tun_loop() {
 
 void VPNClient::send_keep_alive() {
     // зашифрованный служебный пакет с адресом клиента: по нему сервер обновляет адрес клиента за NAT
-    auto plain = make_keep_alive(m_tun_ip_be);
+    auto plain = make_keep_alive(m_tun_ip_be, wall_clock_ns());
     std::array<char, KEEP_ALIVE_SIZE + Crypto::overhead()> sealed;
     std::size_t sealed_size = 0;
-    if (!m_crypto.encrypt(plain.data(), plain.size(), sealed.data(), sealed_size)) return;
+    if (!m_crypto.seal(m_tx.next(), plain.data(), plain.size(), sealed.data(), sealed_size)) return;
     if (::sendto(m_udp_fd, sealed.data(), sealed_size, 0, reinterpret_cast<const sockaddr*>(&m_server_addr), sizeof(m_server_addr)) < 0 &&
         errno != ECONNREFUSED) {
         log_msg(LOG_WARNING, "Не удалось отправить keep-alive: {}", errno_str(errno));
+    }
+}
+
+void VPNClient::check_server_alive() {
+    std::int64_t seen = m_server_seen_ns.load(std::memory_order_relaxed);
+    auto silence = std::chrono::steady_clock::now().time_since_epoch() - std::chrono::steady_clock::duration(seen);
+    if (silence < SERVER_SILENCE) {
+        m_server_lost_logged = false;
+        return;
+    }
+    if (m_server_lost_logged) return;
+    m_server_lost_logged = true;
+    log_msg(LOG_WARNING, "Сервер {}:{} не отвечает на keep-alive больше {} с: проверьте адрес, порт, ключ и часы", m_server_ip, m_port,
+            SERVER_SILENCE.count());
+}
+
+void VPNClient::log_rejected(PeerState::Verdict v, const std::optional<KeepAlive>& ka) {
+    if (v == PeerState::Verdict::CLOCK_SKEW && ka && m_skew_log.allow()) {
+        double skew = static_cast<double>(ka->time_ns - wall_clock_ns()) / 1e9;
+        log_msg(LOG_WARNING, "Keep-alive сервера отклонён: часы сервера расходятся с клиентом на {:+.0f} с, допустимо {} с; проверьте NTP", skew,
+                MAX_CLOCK_SKEW.count());
+    } else if (v == PeerState::Verdict::STALE_SESSION && m_stale_log.allow()) {
+        log_msg(LOG_WARNING, "Keep-alive сервера отклонён: сессия начата раньше текущей (повтор старого пакета или часы сервера ушли назад)");
     }
 }
 

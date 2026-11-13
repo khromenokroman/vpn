@@ -29,6 +29,7 @@ add_library(vpn_share STATIC
         src/share/net.cpp
         src/share/packet.cpp
         src/share/routing.cpp
+        src/share/replay.cpp
 )
 target_include_directories(vpn_share PUBLIC src)
 target_compile_options(vpn_share PUBLIC -Wall -Wextra)
@@ -104,6 +105,7 @@ if (BUILD_TESTS)
             tests/test_crypto.cpp
             tests/test_key_file.cpp
             tests/test_net.cpp
+            tests/test_replay.cpp
             tests/test_stop_event.cpp
     )
     target_link_libraries(vpn_tests PRIVATE vpn_share GTest::gtest_main GTest::gmock)
