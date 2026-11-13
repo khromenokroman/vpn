@@ -1,0 +1,16 @@
+#!/bin/sh
+# Снятие службы. purge удаляет настройки; ключ /etc/poma-vpn/key остаётся: он общий для сервера
+# и клиентов, и без него подключённые клиенты перестанут работать.
+set -e
+
+if [ -d /run/systemd/system ]; then
+    systemctl --system daemon-reload >/dev/null || true
+fi
+if [ "$1" = "remove" ]; then
+    deb-systemd-helper mask @VPN_UNIT@ >/dev/null || true
+fi
+if [ "$1" = "purge" ]; then
+    deb-systemd-helper purge @VPN_UNIT@ >/dev/null || true
+    deb-systemd-helper unmask @VPN_UNIT@ >/dev/null || true
+fi
+exit 0

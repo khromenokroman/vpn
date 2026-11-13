@@ -1,0 +1,8 @@
+#!/bin/sh
+# Остановка службы перед удалением пакета; при обновлении её перезапускает postinst.
+set -e
+
+if [ -d /run/systemd/system ] && [ "$1" = "remove" ]; then
+    deb-systemd-invoke stop @VPN_UNIT@ >/dev/null || true
+fi
+exit 0

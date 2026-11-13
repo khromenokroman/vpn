@@ -1,0 +1,41 @@
+[Unit]
+Description=poma-vpn: клиент VPN
+Documentation=https://github.com/khromenokroman/vpn
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-@CMAKE_INSTALL_FULL_SYSCONFDIR@/default/poma-vpn-client
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/vpn-client $VPN_CLIENT_OPTS
+# ключ передаётся копией в $CREDENTIALS_DIRECTORY, процессу не нужен доступ к /etc/poma-vpn
+LoadCredential=vpn-key:@CMAKE_INSTALL_FULL_SYSCONFDIR@/poma-vpn/key
+Restart=on-failure
+RestartSec=3
+
+# root нужен для TUN и маршрутов; оставлены только сетевые привилегии
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectKernelTunables=yes
+ProtectHome=yes
+PrivateTmp=yes
+DevicePolicy=closed
+DeviceAllow=/dev/net/tun rw
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

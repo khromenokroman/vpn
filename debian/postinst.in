@@ -1,0 +1,28 @@
+#!/bin/sh
+# Регистрация службы @VPN_UNIT@. При установке служба не запускается: сначала нужен ключ и параметры
+# в /etc/default/@VPN_PACKAGE@, затем systemctl enable --now @VPN_UNIT@. При обновлении работающая
+# служба перезапускается, включённая остаётся включённой.
+set -e
+
+if [ "$1" = "configure" ] || [ "$1" = "abort-upgrade" ] || [ "$1" = "abort-deconfigure" ] || [ "$1" = "abort-remove" ]; then
+    install -d -m 700 @CMAKE_INSTALL_FULL_SYSCONFDIR@/poma-vpn
+    if [ "@VPN_GENERATE_KEY@" = yes ] && [ ! -e @CMAKE_INSTALL_FULL_SYSCONFDIR@/poma-vpn/key ]; then
+        # 32 случайных байта; файл тот же скопировать клиентам
+        (umask 077 && head -c 32 /dev/urandom | base64 > @CMAKE_INSTALL_FULL_SYSCONFDIR@/poma-vpn/key)
+        echo "@VPN_PACKAGE@: создан ключ @CMAKE_INSTALL_FULL_SYSCONFDIR@/poma-vpn/key, скопируйте его на клиенты"
+    fi
+    deb-systemd-helper unmask @VPN_UNIT@ >/dev/null || true
+    # was-enabled без истории службы отвечает «да», поэтому при первой установке только запоминаем состояние
+    if deb-systemd-helper debian-installed @VPN_UNIT@ && deb-systemd-helper --quiet was-enabled @VPN_UNIT@; then
+        deb-systemd-helper enable @VPN_UNIT@ >/dev/null || true
+    else
+        deb-systemd-helper update-state @VPN_UNIT@ >/dev/null || true
+    fi
+    if [ -d /run/systemd/system ]; then
+        systemctl --system daemon-reload >/dev/null || true
+        if [ -n "$2" ]; then
+            deb-systemd-invoke try-restart @VPN_UNIT@ >/dev/null || true
+        fi
+    fi
+fi
+exit 0
