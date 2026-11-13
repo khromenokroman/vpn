@@ -1,238 +1,245 @@
+#include "client.hpp"
+
 #include <arpa/inet.h>
 #include <linux/ip.h>
 #include <sys/socket.h>
-#include <sys/syslog.h>
+#include <syslog.h>
+#include <unistd.h>
 
-#include <atomic>
+#include <algorithm>
+#include <array>
 #include <boost/program_options.hpp>
+#include <cerrno>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <cstring>
-#include <filesystem>
+#include <exception>
 #include <iostream>
-#include <optional>
-#include <thread>
 
-#include "../share/crypto.hpp"
-#include "../share/device.hpp"
-#include "../share/key_file.hpp"
-#include "../share/os.hpp"
+#include "share/key_file.hpp"
+#include "share/log.hpp"
+#include "share/os.hpp"
 
-class VPNClient {
-   private:
-    int m_udp_fd = -1;
-    TunDevice m_tun;
-    sockaddr_in m_server_addr{};
-    std::atomic<bool> m_running{true};
+namespace {
 
-    std::thread m_tun_to_udp_thread;
-    std::thread m_udp_to_tun_thread;
-    std::string m_tun_name;
-    std::string m_tun_ip;
-    std::size_t m_port;
-    std::size_t m_mtu;
-    std::string m_server_ip;
-    Crypto m_crypto;
-    std::atomic<uint64_t> m_packets_sent{0};
-    std::atomic<uint64_t> m_packets_received{0};
+/** @brief Период keep-alive: сервер забывает клиента через 60 с тишины. */
+constexpr auto KEEP_ALIVE_INTERVAL = std::chrono::seconds(10);
+/** @brief Статистика пишется каждый N-й keep-alive. */
+constexpr unsigned STATS_EVERY = 3;
+/** @brief Запас буфера шифротекста сверх BUFFER_SIZE, не меньше Crypto::overhead(). */
+constexpr std::size_t CRYPTO_SLACK = 128;
+static_assert(CRYPTO_SLACK >= Crypto::overhead());
 
-   public:
-    VPNClient(std::string_view server_ip, std::size_t port, std::size_t mtu, std::string_view tun_name, std::string_view tun_ip, std::string_view key)
-        : m_tun_name{tun_name}, m_tun_ip{tun_ip}, m_port{port}, m_mtu{mtu}, m_server_ip{server_ip}, m_crypto{key} {}
+} // namespace
 
-    ~VPNClient() { stop(); }
+VPNClient::VPNClient(std::string_view server_ip, std::uint16_t port, std::size_t mtu, std::string_view tun_name, std::string_view tun_ip,
+                     std::string_view key)
+    : m_tun_name{tun_name}, m_tun_ip{tun_ip}, m_server_ip{server_ip}, m_crypto{key}, m_mtu{mtu}, m_port{port} {}
 
-    bool init() {
-        // 1. Создаём TUN
-        if (!m_tun.open(m_tun_name, m_tun_ip, m_mtu)) {
-            syslog(LOG_ERR, "Не удалось создать TUN-устройство");
-            return false;
-        }
+VPNClient::~VPNClient() { stop(); }
 
-        // 2. Запоминаем интерфейс и шлюз ДО изменения маршрутов
-        std::string iface = Os().get_default_interface();
-        std::string gateway = Os().get_default_gateway();
-
-        // 3. Добавляем маршрут до сервера через реальный интерфейс
-        if (!gateway.empty() && !iface.empty()) {
-            std::string cmd = "ip route add " + m_server_ip + " via " + gateway + " dev " + iface + " 2>/dev/null";
-            if (system(cmd.c_str()) != 0) {
-                syslog(LOG_WARNING, "Не удалось добавить маршрут до сервера");
-            } else {
-                syslog(LOG_INFO, "Маршрут до сервера %s через %s dev %s", m_server_ip.c_str(), gateway.c_str(), iface.c_str());
-            }
-        }
-
-        // 4. Маршрут по умолчанию через tun0
-        Os().setup_client_routes();
-
-        // 5. Создаём UDP-сокет
-        m_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-        if (m_udp_fd < 0) {
-            syslog(LOG_ERR, "Не удалось создать UDP-сокет: %s", strerror(errno));
-            return false;
-        }
-
-        // 6. Привязываем UDP-сокет к реальному интерфейсу (чтобы он шёл в обход VPN)
-        if (!iface.empty()) {
-            if (setsockopt(m_udp_fd, SOL_SOCKET, SO_BINDTODEVICE, iface.c_str(), iface.length()) < 0) {
-                syslog(LOG_WARNING, "SO_BINDTODEVICE %s: %s", iface.c_str(), strerror(errno));
-            } else {
-                syslog(LOG_INFO, "UDP-сокет привязан к интерфейсу %s", iface.c_str());
-            }
-        }
-
-        // 7. Увеличиваем буферы UDP-сокета
-        Os().tune_udp_socket(m_udp_fd);
-
-        // 8. Адрес сервера
-        m_server_addr.sin_family = AF_INET;
-        m_server_addr.sin_port = htons(m_port);
-        if (inet_pton(AF_INET, m_server_ip.c_str(), &m_server_addr.sin_addr) != 1) {
-            syslog(LOG_ERR, "Недопустимый IP сервера: %s", m_server_ip.c_str());
-            return false;
-        }
-
-        syslog(LOG_INFO, "VPN-клиент инициализирован, сервер %s:%zu", m_server_ip.c_str(), m_port);
-        return true;
+bool VPNClient::init() {
+    if (!m_tun.open(m_tun_name, m_tun_ip, m_mtu)) {
+        log_msg(LOG_ERR, "Не удалось создать TUN-устройство");
+        return false;
     }
 
-    void run() {
-        syslog(LOG_INFO, "Запуск VPN-клиента...");
+    // интерфейс и шлюз запоминаются до смены маршрута по умолчанию
+    std::string iface = Os().get_default_interface();
+    std::string gateway = Os().get_default_gateway();
 
-        // Отправляем первый keep-alive, чтобы сервер узнал наш endpoint
-        send_keep_alive();
-
-        m_tun_to_udp_thread = std::thread([this]() { tun_to_udp_loop(); });
-        m_udp_to_tun_thread = std::thread([this]() { udp_to_tun_loop(); });
-
-        syslog(LOG_INFO, "VPN-клиент запущен");
-
-        // Цикл статистики и keep-alive в главном потоке
-        uint64_t last_sent = 0, last_recv = 0;
-        int counter = 0;
-        while (m_running) {
-            std::this_thread::sleep_for(std::chrono::seconds(10));
-            if (!m_running) break;
-
-            // Keep-alive каждые 10 секунд
-            send_keep_alive();
-
-            // Статистика каждые 30 секунд
-            if (++counter % 3 == 0) {
-                uint64_t s = m_packets_sent.load();
-                uint64_t r = m_packets_received.load();
-                syslog(LOG_DEBUG, "Статистика: отправлено=%lu (+%lu), получено=%lu (+%lu)", s, s - last_sent, r, r - last_recv);
-                last_sent = s;
-                last_recv = r;
-            }
+    // маршрут до сервера через реальный интерфейс, чтобы сам туннель не шёл в туннель
+    if (!gateway.empty() && !iface.empty()) {
+        std::string cmd = "ip route add " + m_server_ip + " via " + gateway + " dev " + iface + " 2>/dev/null";
+        if (std::system(cmd.c_str()) != 0) {
+            log_msg(LOG_WARNING, "Не удалось добавить маршрут до сервера");
+        } else {
+            log_msg(LOG_INFO, "Маршрут до сервера {} через {} dev {}", m_server_ip, gateway, iface);
         }
     }
 
-    void stop() {
-        if (!m_running.exchange(false)) return;
-        if (m_udp_fd >= 0) {
-            shutdown(m_udp_fd, SHUT_RDWR);
-            ::close(m_udp_fd);
-            m_udp_fd = -1;
-        }
-        m_tun.close();
-        if (m_tun_to_udp_thread.joinable()) m_tun_to_udp_thread.join();
-        if (m_udp_to_tun_thread.joinable()) m_udp_to_tun_thread.join();
-        syslog(LOG_INFO, "VPN-клиент остановлен");
+    Os().setup_client_routes(m_tun_name);
+
+    m_udp_fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (m_udp_fd < 0) {
+        log_msg(LOG_ERR, "Не удалось создать UDP-сокет: {}", errno_str(errno));
+        return false;
     }
 
-   private:
-    // Поток №1: TUN -> UDP
-    void tun_to_udp_loop() {
-        char plain_buffer[BUFFER_SIZE];
-        char encrypted_buffer[BUFFER_SIZE + 128];
-        int tun_fd = m_tun.get_fd();
-
-        while (m_running) {
-            ssize_t n = ::read(tun_fd, plain_buffer, BUFFER_SIZE);
-            if (n <= 0) {
-                if (n < 0 && errno != EINTR && m_running) {
-                    syslog(LOG_ERR, "Ошибка чтения из TUN: %s", strerror(errno));
-                }
-                if (n == 0 || (n < 0 && errno != EINTR)) break;
-                continue;
-            }
-
-            if (n < (ssize_t)sizeof(struct iphdr)) continue;
-
-            struct iphdr* ip = (struct iphdr*)plain_buffer;
-            //@todo: надо фильтровать по сети
-            if (ip->daddr == inet_addr("192.168.200.1") || ip->daddr == inet_addr("192.168.200.2") || ip->daddr == inet_addr("192.168.200.3")) {
-                continue;
-            }
-
-            std::size_t encrypted_size = 0;
-            if (!m_crypto.encrypt(plain_buffer, static_cast<std::size_t>(n), encrypted_buffer, encrypted_size)) {
-                continue;
-            }
-
-            ssize_t sent = ::sendto(m_udp_fd, encrypted_buffer, encrypted_size, 0, (sockaddr*)&m_server_addr, sizeof(m_server_addr));
-            if (sent > 0) {
-                m_packets_sent.fetch_add(1, std::memory_order_relaxed);
-            } else if (sent < 0 && errno != EINTR && errno != EAGAIN) {
-                if (m_running) syslog(LOG_ERR, "sendto UDP: %s", strerror(errno));
-            }
+    if (!iface.empty()) {
+        if (::setsockopt(m_udp_fd, SOL_SOCKET, SO_BINDTODEVICE, iface.c_str(), iface.size()) < 0) {
+            log_msg(LOG_WARNING, "SO_BINDTODEVICE {}: {}", iface, errno_str(errno));
+        } else {
+            log_msg(LOG_INFO, "UDP-сокет привязан к интерфейсу {}", iface);
         }
     }
 
-    // Поток №2: UDP -> TUN
-    void udp_to_tun_loop() {
-        char encrypted_buffer[BUFFER_SIZE + 128];
-        char plain_buffer[BUFFER_SIZE];
-        int tun_fd = m_tun.get_fd();
+    Os().tune_udp_socket(m_udp_fd);
 
-        while (m_running) {
-            ssize_t n = ::recv(m_udp_fd, encrypted_buffer, sizeof(encrypted_buffer), 0);
-            if (n <= 0) {
-                if (n < 0 && errno != EINTR && m_running) {
-                    syslog(LOG_ERR, "Ошибка чтения UDP: %s", strerror(errno));
-                }
-                if (n == 0 || (n < 0 && errno != EINTR)) break;
-                continue;
-            }
+    m_server_addr.sin_family = AF_INET;
+    m_server_addr.sin_port = htons(m_port);
+    if (::inet_pton(AF_INET, m_server_ip.c_str(), &m_server_addr.sin_addr) != 1) {
+        log_msg(LOG_ERR, "Недопустимый IP сервера: {}", m_server_ip);
+        return false;
+    }
 
-            std::size_t plain_size = 0;
-            if (!m_crypto.decrypt(encrypted_buffer, static_cast<std::size_t>(n), plain_buffer, plain_size)) {
-                continue;
-            }
+    log_msg(LOG_INFO, "VPN-клиент инициализирован, сервер {}:{}", m_server_ip, m_port);
+    return true;
+}
 
-            ssize_t written = ::write(tun_fd, plain_buffer, plain_size);
-            if (written > 0) {
-                m_packets_received.fetch_add(1, std::memory_order_relaxed);
-            } else if (written < 0 && errno != EINTR && m_running) {
-                syslog(LOG_ERR, "Ошибка записи в TUN: %s", strerror(errno));
+bool VPNClient::run(const SignalFd& signals) {
+    log_msg(LOG_INFO, "Запуск VPN-клиента...");
+    send_keep_alive();
+
+    m_tun_to_udp_thread = std::thread([this]() { tun_to_udp_loop(); });
+    m_udp_to_tun_thread = std::thread([this]() { udp_to_tun_loop(); });
+    log_msg(LOG_INFO, "VPN-клиент запущен");
+
+    unsigned ticks = 0;
+    auto next_tick = std::chrono::steady_clock::now() + KEEP_ALIVE_INTERVAL;
+    for (;;) {
+        auto timeout = std::chrono::duration_cast<std::chrono::milliseconds>(next_tick - std::chrono::steady_clock::now());
+        switch (m_stop.wait_readable(signals.get_fd(), std::max(timeout, std::chrono::milliseconds{0}))) {
+            case StopEvent::Wait::READY: {
+                int sig = signals.read_signal();
+                const char* name = sig > 0 ? ::sigabbrev_np(sig) : nullptr;
+                log_msg(LOG_INFO, "Получен сигнал SIG{}, остановка", name ? name : "?");
+                return true;
             }
+            case StopEvent::Wait::STOP:
+                log_msg(LOG_ERR, "Рабочий поток остановился с ошибкой, завершение");
+                return false;
+            case StopEvent::Wait::TIMEOUT:
+                send_keep_alive();
+                if (++ticks % STATS_EVERY == 0) log_stats();
+                next_tick += KEEP_ALIVE_INTERVAL;
+                break;
+            case StopEvent::Wait::ERROR:
+                log_msg(LOG_ERR, "Ошибка ожидания сигнала: {}", errno_str(errno));
+                return false;
         }
     }
+}
 
-    void send_keep_alive() {
-        const char dummy = 0;
-        ::sendto(m_udp_fd, &dummy, 0, 0, (sockaddr*)&m_server_addr, sizeof(m_server_addr));
+void VPNClient::log_stats() {
+    std::uint64_t s = m_packets_sent.load(std::memory_order_relaxed);
+    std::uint64_t r = m_packets_received.load(std::memory_order_relaxed);
+    log_msg(LOG_DEBUG, "Статистика: отправлено={} (+{}), получено={} (+{})", s, s - m_last_sent, r, r - m_last_received);
+    m_last_sent = s;
+    m_last_received = r;
+}
+
+void VPNClient::stop() noexcept {
+    if (m_stopped) return;
+    m_stopped = true;
+    m_stop.notify();
+    if (m_tun_to_udp_thread.joinable()) m_tun_to_udp_thread.join();
+    if (m_udp_to_tun_thread.joinable()) m_udp_to_tun_thread.join();
+    // дескрипторы закрываются только после join, см. VPNServer::stop
+    if (m_udp_fd >= 0) {
+        ::close(m_udp_fd);
+        m_udp_fd = -1;
     }
-};
+    m_tun.close();
+    log_msg(LOG_INFO, "VPN-клиент остановлен");
+}
 
-static VPNClient* g_client = nullptr;
+void VPNClient::tun_to_udp_loop() {
+    std::array<char, BUFFER_SIZE> plain_buffer;
+    std::array<char, BUFFER_SIZE + CRYPTO_SLACK> encrypted_buffer;
+    const int tun_fd = m_tun.get_fd();
+    const std::uint32_t skip1 = ::inet_addr("192.168.200.1");
+    const std::uint32_t skip2 = ::inet_addr("192.168.200.2");
+    const std::uint32_t skip3 = ::inet_addr("192.168.200.3");
+
+    for (;;) {
+        StopEvent::Wait w = m_stop.wait_readable(tun_fd);
+        if (w == StopEvent::Wait::STOP) return;
+        if (w == StopEvent::Wait::ERROR) {
+            log_msg(LOG_ERR, "Ошибка ожидания TUN: {}", errno_str(errno));
+            break;
+        }
+
+        ssize_t n = ::read(tun_fd, plain_buffer.data(), plain_buffer.size());
+        if (n < 0) {
+            if (errno == EINTR || errno == EAGAIN) continue;
+            log_msg(LOG_ERR, "Ошибка чтения TUN: {}", errno_str(errno));
+            break;
+        }
+        if (n < static_cast<ssize_t>(sizeof(iphdr))) continue;
+
+        iphdr ip;
+        std::memcpy(&ip, plain_buffer.data(), sizeof(ip));
+        //@todo: надо фильтровать по сети
+        if (ip.daddr == skip1 || ip.daddr == skip2 || ip.daddr == skip3) {
+            continue;
+        }
+
+        std::size_t encrypted_size = 0;
+        if (!m_crypto.encrypt(plain_buffer.data(), static_cast<std::size_t>(n), encrypted_buffer.data(), encrypted_size)) {
+            continue;
+        }
+
+        ssize_t sent =
+            ::sendto(m_udp_fd, encrypted_buffer.data(), encrypted_size, 0, reinterpret_cast<const sockaddr*>(&m_server_addr), sizeof(m_server_addr));
+        if (sent >= 0) {
+            m_packets_sent.fetch_add(1, std::memory_order_relaxed);
+        } else if (errno != EINTR && errno != EAGAIN && errno != ECONNREFUSED) {
+            log_msg(LOG_ERR, "Ошибка отправки на сервер: {}", errno_str(errno));
+        }
+    }
+    m_stop.notify();
+}
+
+void VPNClient::udp_to_tun_loop() {
+    std::array<char, BUFFER_SIZE + CRYPTO_SLACK> encrypted_buffer;
+    std::array<char, BUFFER_SIZE> plain_buffer;
+    const int tun_fd = m_tun.get_fd();
+
+    for (;;) {
+        StopEvent::Wait w = m_stop.wait_readable(m_udp_fd);
+        if (w == StopEvent::Wait::STOP) return;
+        if (w == StopEvent::Wait::ERROR) {
+            log_msg(LOG_ERR, "Ошибка ожидания UDP: {}", errno_str(errno));
+            break;
+        }
+
+        ssize_t n = ::recv(m_udp_fd, encrypted_buffer.data(), encrypted_buffer.size(), 0);
+        if (n < 0) {
+            // ECONNREFUSED: сервер ещё не запущен, ICMP port unreachable на прошлую отправку
+            if (errno == EINTR || errno == EAGAIN || errno == ECONNREFUSED) continue;
+            log_msg(LOG_ERR, "Ошибка приёма UDP: {}", errno_str(errno));
+            break;
+        }
+
+        std::size_t plain_size = 0;
+        if (!m_crypto.decrypt(encrypted_buffer.data(), static_cast<std::size_t>(n), plain_buffer.data(), plain_size)) {
+            continue;
+        }
+
+        ssize_t written = ::write(tun_fd, plain_buffer.data(), plain_size);
+        if (written >= 0) {
+            m_packets_received.fetch_add(1, std::memory_order_relaxed);
+        } else if (errno != EINTR && errno != EAGAIN) {
+            log_msg(LOG_WARNING, "Ошибка записи в TUN: {}", errno_str(errno));
+        }
+    }
+    m_stop.notify();
+}
+
+void VPNClient::send_keep_alive() {
+    const char dummy = 0;
+    ::sendto(m_udp_fd, &dummy, 0, 0, reinterpret_cast<const sockaddr*>(&m_server_addr), sizeof(m_server_addr));
+}
+
 namespace po = boost::program_options;
 
-int main(int argc, char* argv[]) {
+int main(int argc, char* argv[]) try {
     Os().init_syslog("vpn-client", LOG_INFO);
-    signal(SIGINT, [](int) {
-        syslog(LOG_INFO, "Получен сигнал SIGINT");
-        if (g_client) g_client->stop();
-        exit(EXIT_SUCCESS);
-    });
-    signal(SIGTERM, [](int) {
-        syslog(LOG_INFO, "Получен сигнал SIGTERM");
-        if (g_client) g_client->stop();
-        exit(EXIT_SUCCESS);
-    });
-    signal(SIGPIPE, SIG_IGN);
+    // до создания потоков: маска наследуется, сигналы читаются только из signalfd
+    SignalFd signals({SIGINT, SIGTERM});
+    std::signal(SIGPIPE, SIG_IGN);
 
     std::string server_ip;
     int port = 0;
@@ -253,7 +260,6 @@ int main(int argc, char* argv[]) {
     po::variables_map vm;
     try {
         po::store(po::parse_command_line(argc, argv, desc), vm);
-
         if (vm.count("help")) {
             std::cout << desc << std::endl;
             return EXIT_SUCCESS;
@@ -262,57 +268,52 @@ int main(int argc, char* argv[]) {
             std::cout << POMA_VPN_VERSION << std::endl;
             return EXIT_SUCCESS;
         }
-
         po::notify(vm);
     } catch (const po::error& e) {
         std::cerr << "Ошибка параметров: " << e.what() << "\n\n" << desc << std::endl;
-        syslog(LOG_ERR, "Ошибка параметров: %s", e.what());
+        log_msg(LOG_ERR, "Ошибка параметров: {}", e.what());
         return EXIT_FAILURE;
     }
 
     if (port <= 0 || port > 65535) {
-        std::cerr << "Недопустимый порт: " << port << std::endl;
-        syslog(LOG_ERR, "Недопустимый порт: %d", port);
+        report_error("Недопустимый порт: {}", port);
         return EXIT_FAILURE;
     }
     if (mtu < 576 || mtu > 65535) {
-        std::cerr << "Недопустимый MTU: " << mtu << std::endl;
+        report_error("Недопустимый MTU: {}", mtu);
         return EXIT_FAILURE;
     }
-
-    if (geteuid() != 0) {
-        std::cerr << "Клиент должен быть запущен от имени root" << std::endl;
-        syslog(LOG_ERR, "Клиент должен быть запущен от имени root");
+    if (::geteuid() != 0) {
+        report_error("Клиент должен быть запущен от имени root");
         return EXIT_FAILURE;
     }
     if (sodium_init() < 0) {
-        std::cerr << "Не удалось инициализировать libsodium" << std::endl;
-        syslog(LOG_ERR, "Не удалось инициализировать libsodium");
+        report_error("Не удалось инициализировать libsodium");
         return EXIT_FAILURE;
     }
 
-    std::optional<std::filesystem::path> key_path_arg;
-    if (!key_file.empty()) key_path_arg = key_file;
     SecretBuffer key(1);
     try {
-        key = read_key_file(resolve_key_path(key_path_arg, std::getenv("CREDENTIALS_DIRECTORY")));
+        key = load_key(key_file);
     } catch (const KeyFileError& e) {
-        std::cerr << e.what() << std::endl;
-        syslog(LOG_ERR, "%s", e.what());
+        report_error("{}", e.what());
         return EXIT_FAILURE;
     }
 
-    syslog(LOG_INFO, "Запуск VPN-клиента: server=%s:%d, mtu=%d, tun=%s/%s", server_ip.c_str(), port, mtu, tun_name.c_str(), tun_ip.c_str());
+    log_msg(LOG_INFO, "Запуск VPN-клиента {}: server={}:{}, mtu={}, tun={}/{}", POMA_VPN_VERSION, server_ip, port, mtu, tun_name, tun_ip);
 
-    VPNClient client(server_ip, port, mtu, tun_name, tun_ip, key.view());
-    g_client = &client;
+    VPNClient client(server_ip, static_cast<std::uint16_t>(port), static_cast<std::size_t>(mtu), tun_name, tun_ip, key.view());
+    key = SecretBuffer(1);
 
     if (!client.init()) {
-        syslog(LOG_ERR, "Не удалось инициализировать клиент");
+        report_error("Не удалось инициализировать клиент, подробности в журнале: journalctl -t vpn-client");
         return EXIT_FAILURE;
     }
-    client.run();
-
+    bool by_signal = client.run(signals);
+    client.stop();
     Os().close_syslog();
-    return EXIT_SUCCESS;
+    return by_signal ? EXIT_SUCCESS : EXIT_FAILURE;
+} catch (const std::exception& e) {
+    report_error("Аварийное завершение: {}", e.what());
+    return EXIT_FAILURE;
 }

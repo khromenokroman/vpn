@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 /**
@@ -85,3 +86,11 @@ SecretBuffer read_key_file(const std::filesystem::path& path);
  * @throw KeyFileError если не задано ни то, ни другое
  */
 std::filesystem::path resolve_key_path(const std::optional<std::filesystem::path>& key_file, const char* credentials_dir);
+
+/**
+ * @brief Загружает ключ для запуска: путь из --key-file или $CREDENTIALS_DIRECTORY/vpn-key.
+ * @param key_file значение --key-file, пустая строка - не задан
+ * @return секрет
+ * @throw KeyFileError если путь не задан или файл не прошёл проверки
+ */
+SecretBuffer load_key(const std::string& key_file);

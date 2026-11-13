@@ -1,8 +1,13 @@
 #pragma once
-#include <string>
 
-#define BUFFER_SIZE 65536
-#define UDP_SOCKET_BUF_SIZE (8 * 1024 * 1024)
+#include <cstddef>
+#include <string>
+#include <string_view>
+
+/** @brief Размер буфера пакета: максимальный IP-пакет. */
+inline constexpr std::size_t BUFFER_SIZE = 65536;
+/** @brief Желаемый размер буферов UDP-сокета. */
+inline constexpr int UDP_SOCKET_BUF_SIZE = 8 * 1024 * 1024;
 
 class Os {
    public:

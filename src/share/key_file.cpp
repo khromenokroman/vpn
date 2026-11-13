@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <new>
 #include <utility>
@@ -132,4 +133,10 @@ std::filesystem::path resolve_key_path(const std::optional<std::filesystem::path
         return std::filesystem::path(credentials_dir) / KEY_CREDENTIAL_NAME;
     }
     throw KeyFileError(fmt::format("не задан файл ключа: укажите --key-file или LoadCredential={}:<путь> в юните systemd", KEY_CREDENTIAL_NAME));
+}
+
+SecretBuffer load_key(const std::string& key_file) {
+    std::optional<std::filesystem::path> path;
+    if (!key_file.empty()) path = key_file;
+    return read_key_file(resolve_key_path(path, std::getenv("CREDENTIALS_DIRECTORY")));
 }

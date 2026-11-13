@@ -2,9 +2,15 @@
 
 #include <fmt/format.h>
 #include <sys/socket.h>
-#include <sys/syslog.h>
+#include <syslog.h>
 
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <string>
+
+#include "log.hpp"
+
 void Os::tune_udp_socket(int fd, int size) {
     if (setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, sizeof(size)) < 0) {
         setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &size, sizeof(size));
@@ -16,25 +22,25 @@ void Os::tune_udp_socket(int fd, int size) {
     socklen_t len = sizeof(int);
     getsockopt(fd, SOL_SOCKET, SO_RCVBUF, &actual_rcv, &len);
     getsockopt(fd, SOL_SOCKET, SO_SNDBUF, &actual_snd, &len);
-    syslog(LOG_INFO, "UDP-сокет: SO_RCVBUF=%d, SO_SNDBUF=%d", actual_rcv, actual_snd);
+    log_msg(LOG_INFO, "UDP-сокет: SO_RCVBUF={}, SO_SNDBUF={}", actual_rcv, actual_snd);
 }
 void Os::setup_client_routes(std::string_view tun_name) {
-    system("ip route del default");
-    syslog(LOG_INFO, "Удален маршрут по умолчанию");
-    system(::fmt::format("ip route add default via 192.168.200.1 dev {}", tun_name).c_str());
-    syslog(LOG_INFO, "Маршрут по умолчанию установлен через %s", tun_name.data());
+    std::system("ip route del default");
+    log_msg(LOG_INFO, "Удалён маршрут по умолчанию");
+    std::system(::fmt::format("ip route add default via 192.168.200.1 dev {}", tun_name).c_str());
+    log_msg(LOG_INFO, "Маршрут по умолчанию установлен через {}", tun_name);
 }
 void Os::setup_server_routes(std::string_view tun_name, std::string_view external_iface, std::size_t vpn_port) {
-    system(::fmt::format("iptables -t nat -D POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
-    system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
-    system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
-    system(::fmt::format("iptables -D INPUT -p udp --dport {} -j ACCEPT", vpn_port).c_str());
-    system(::fmt::format("iptables -t nat -A POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
-    system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
-    system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
-    system(::fmt::format("iptables -I INPUT 1 -p udp --dport {} -j ACCEPT", vpn_port).c_str());
-    system("echo 1 > /proc/sys/net/ipv4/ip_forward");
-    syslog(LOG_INFO, "Правила NAT настроены для %s через %s на порту %lu", tun_name.data(), external_iface.data(), vpn_port);
+    std::system(::fmt::format("iptables -t nat -D POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
+    std::system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
+    std::system(::fmt::format("iptables -D FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
+    std::system(::fmt::format("iptables -D INPUT -p udp --dport {} -j ACCEPT", vpn_port).c_str());
+    std::system(::fmt::format("iptables -t nat -A POSTROUTING -s 192.168.200.0/24 -o {} -j MASQUERADE", external_iface).c_str());
+    std::system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", tun_name, external_iface).c_str());
+    std::system(::fmt::format("iptables -A FORWARD -i {} -o {} -j ACCEPT", external_iface, tun_name).c_str());
+    std::system(::fmt::format("iptables -I INPUT 1 -p udp --dport {} -j ACCEPT", vpn_port).c_str());
+    std::system("echo 1 > /proc/sys/net/ipv4/ip_forward");
+    log_msg(LOG_INFO, "Правила NAT настроены для {} через {} на порту {}", tun_name, external_iface, vpn_port);
 }
 std::string Os::get_default_interface() {
     FILE* fp = popen("ip route | grep default | awk '{print $5}'", "r");
