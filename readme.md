@@ -97,38 +97,36 @@ build/src/server/vpn-server
 build/src/client/vpn-client
 ```
 
-## Генерация ключа шифрования
+## Ключ шифрования
 
-Клиент и сервер должны использовать **одинаковый общий ключ**.
+Клиент и сервер должны использовать **одинаковый общий ключ**. Ключ читается только из файла:
+в аргументах командной строки он был бы виден всем пользователям через `ps` и `/proc/<pid>/cmdline`.
 
-Сгенерировать ключ можно так:
-
-```bash
-openssl rand -base64 32
-```
-
-Пример результата:
-
-```text
-CvEE3TRqqNNpmxy+/kk07Qk9912ZyCqUlv0ay5006KY=
-```
-
-Пример сохранения ключа в файл:
+Создать ключ:
 
 ```bash
-sudo mkdir -p /etc/myvpn
-openssl rand -base64 32 | sudo tee /etc/myvpn/key
-sudo chmod 600 /etc/myvpn/key
+sudo install -d -m 700 /etc/poma-vpn
+openssl rand -base64 32 | sudo install -m 600 /dev/stdin /etc/poma-vpn/key
 ```
 
-Посмотреть ключ:
+Тот же файл нужно скопировать на клиент (например, через `scp`) с правами `600`.
 
-```bash
-sudo cat /etc/myvpn/key
+Требования к файлу, иначе программа завершится с ошибкой:
+
+- обычный файл, не символьная ссылка;
+- владелец тот же пользователь, от которого запущена программа (`root`);
+- нет прав для группы и остальных (`600` или `400`);
+- размер не больше 4096 байт.
+
+Завершающие пробелы и переводы строки отбрасываются.
+
+Путь задаётся параметром `--key-file`. Без него ключ берётся из `$CREDENTIALS_DIRECTORY/vpn-key`:
+так systemd передаёт файл через `LoadCredential=`, и сам процесс не открывает файлы в `/etc`:
+
+```ini
+[Service]
+LoadCredential=vpn-key:/etc/poma-vpn/key
 ```
-
-> Сейчас ключ передаётся через параметр `--key`. Это удобно для тестов, но не идеально с точки зрения безопасности, потому что аргументы процесса могут быть видны через `ps`. Более безопасный вариант — позже добавить параметр `--key-file`.
-
 
 ## Запуск сервера
 
@@ -137,7 +135,7 @@ sudo cat /etc/myvpn/key
 ```bash
 sudo ./vpn-server \
     --port 1194 \
-    --key 'CvEE3TRqqNNpmxy+/kk07Qk9912ZyCqUlv0ay5006KY='
+    --key-file /etc/poma-vpn/key
 ```
 
 Полный пример:
@@ -148,7 +146,7 @@ sudo ./vpn-server \
     --mtu 1380 \
     --tun-name tun0 \
     --tun-ip 192.168.200.1 \
-    --key 'CvEE3TRqqNNpmxy+/kk07Qk9912ZyCqUlv0ay5006KY='
+    --key-file /etc/poma-vpn/key
 ```
 
 ### Параметры сервера
@@ -160,7 +158,8 @@ sudo ./vpn-server \
 | `--mtu` | `-m` | MTU TUN-интерфейса | `1420` |
 | `--tun-name` | `-n` | Имя TUN-интерфейса | `tun0` |
 | `--tun-ip` | `-i` | IP-адрес TUN-интерфейса сервера | `192.168.200.1` |
-| `--key` | `-k` | Общий ключ шифрования | обязательный |
+| `--key-file` | `-k` | Файл общего ключа | `$CREDENTIALS_DIRECTORY/vpn-key` |
+| `--version` | `-V` | Показать версию | - |
 
 
 ## Запуск клиента
@@ -171,19 +170,19 @@ sudo ./vpn-server \
 sudo ./vpn-client \
     --server <SERVER_PUBLIC_IP> \
     --port 1194 \
-    --key 'CvEE3TRqqNNpmxy+/kk07Qk9912ZyCqUlv0ay5006KY='
+    --key-file /etc/poma-vpn/key
 ```
 
 Пример:
 
 ```bash
 sudo ./vpn-client \
-    --server 1.2.3.4 \
+    --server 203.0.113.10 \
     --port 1194 \
     --mtu 1380 \
     --tun-name tun0 \
     --tun-ip 192.168.200.2 \
-    --key 'CvEE3TRqqNNpmxy+/kk07Qk9912ZyCqUlv0ay5006KY='
+    --key-file /etc/poma-vpn/key
 ```
 
 ### Параметры клиента
@@ -196,7 +195,8 @@ sudo ./vpn-client \
 | `--mtu` | `-m` | MTU TUN-интерфейса | `1420` |
 | `--tun-name` | `-n` | Имя TUN-интерфейса | `tun0` |
 | `--tun-ip` | `-i` | IP-адрес TUN-интерфейса клиента | `192.168.200.2` |
-| `--key` | `-k` | Общий ключ шифрования | обязательный |
+| `--key-file` | `-k` | Файл общего ключа | `$CREDENTIALS_DIRECTORY/vpn-key` |
+| `--version` | `-V` | Показать версию | - |
 
 ## Рекомендация по MTU
 
@@ -260,12 +260,10 @@ journalctl -f -t vpn-client
 - нет защиты от replay-атак;
 - нет полноценного handshake;
 - нет автоматической ротации ключей;
-- общий ключ передаётся через аргумент командной строки;
 - нет разделения ключей по направлениям `client -> server` и `server -> client`.
 
 Что стоит добавить позже:
 
-- `--key-file` вместо `--key`;
 - счётчики пакетов;
 - anti-replay window;
 - разные ключи на разные направления;
