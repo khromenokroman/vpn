@@ -1,16 +1,15 @@
 #include "device.hpp"
 
 #include <fcntl.h>
-#include <fmt/format.h>
 #include <linux/if_tun.h>
 #include <net/if.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
 #include <cerrno>
-#include <cstdlib>
 #include <cstring>
 
+#include "command.hpp"
 #include "log.hpp"
 
 TunDevice::~TunDevice() { close(); }
@@ -48,11 +47,14 @@ bool TunDevice::open(const std::string& name, const std::string& ip, std::size_t
     }
     m_fd = fd;
 
-    std::system(fmt::format("ip addr add {}/24 dev {}", ip, name).c_str());
-    std::system(fmt::format("ip link set {} mtu {}", name, mtu).c_str());
-    std::system(fmt::format("ip link set {} txqueuelen 1000", name).c_str());
-    std::system(fmt::format("ip link set {} up 2>/dev/null", name).c_str());
-    std::system("echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null");
+    // интерфейс не persistent: при закрытии дескриптора ядро удаляет его вместе с адресом и маршрутами
+    const std::string mtu_str = std::to_string(mtu);
+    if (run_command({"ip", "addr", "add", ip + "/24", "dev", name}) != 0 || run_command({"ip", "link", "set", "dev", name, "mtu", mtu_str}) != 0 ||
+        run_command({"ip", "link", "set", "dev", name, "txqueuelen", "1000"}) != 0 || run_command({"ip", "link", "set", "dev", name, "up"}) != 0) {
+        log_msg(LOG_ERR, "Не удалось настроить TUN-интерфейс {}", name);
+        close();
+        return false;
+    }
     log_msg(LOG_INFO, "TUN-устройство {} создано с IP {}, MTU {}", name, ip, mtu);
     return true;
 }

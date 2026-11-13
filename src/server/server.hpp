@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -14,6 +15,7 @@
 
 #include "share/crypto.hpp"
 #include "share/device.hpp"
+#include "share/routing.hpp"
 #include "share/signal_fd.hpp"
 #include "share/stop_event.hpp"
 
@@ -29,11 +31,13 @@ class VPNServer {
     /**
      * @param tun_name имя TUN-интерфейса
      * @param tun_ip адрес сервера в туннеле
+     * @param external_iface внешний интерфейс для NAT; пустой - интерфейс маршрута по умолчанию
      * @param port UDP-порт
      * @param mtu MTU TUN-интерфейса
      * @param key общий секрет
      */
-    VPNServer(std::string_view tun_name, std::string_view tun_ip, std::uint16_t port, std::size_t mtu, std::string_view key);
+    VPNServer(std::string_view tun_name, std::string_view tun_ip, std::string_view external_iface, std::uint16_t port, std::size_t mtu,
+              std::string_view key);
     ~VPNServer();
 
     VPNServer(const VPNServer&) = delete;
@@ -62,8 +66,10 @@ class VPNServer {
     void udp_to_tun_loop();
     void cleanup_loop();
     void log_stats();
+    void touch_client(std::uint32_t tun_ip, const sockaddr_in& peer);
 
     std::unordered_map<std::uint32_t, ClientInfo> m_clients;
+    std::unique_ptr<NatRules> m_nat;
     std::mutex m_clients_mutex;
 
     std::thread m_tun_to_udp_thread;
@@ -84,6 +90,7 @@ class VPNServer {
     std::uint64_t m_last_from = 0;
     std::size_t m_mtu;
 
+    std::uint32_t m_tun_ip_be = 0;
     int m_udp_fd = -1;
     std::uint16_t m_port;
     bool m_stopped = false;
