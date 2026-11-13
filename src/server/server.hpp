@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -15,6 +16,8 @@
 
 #include "share/crypto.hpp"
 #include "share/device.hpp"
+#include "share/log.hpp"
+#include "share/replay.hpp"
 #include "share/routing.hpp"
 #include "share/signal_fd.hpp"
 #include "share/stop_event.hpp"
@@ -22,8 +25,8 @@
 /**
  * @brief VPN-сервер: TUN-интерфейс, UDP-сокет и таблица клиентов.
  *
- * Потоки: TUN -> UDP (поиск клиента по адресу назначения), UDP -> TUN (регистрация клиента по адресу
- * источника) и очистка неактивных клиентов. Остановка через StopEvent, дескрипторы закрываются только
+ * Потоки: TUN -> UDP (поиск клиента по адресу назначения), UDP -> TUN (регистрация клиента по keep-alive,
+ * проверка повторов) и очистка неактивных клиентов. Остановка через StopEvent, дескрипторы закрываются только
  * после завершения потоков.
  */
 class VPNServer {
@@ -58,6 +61,7 @@ class VPNServer {
 
    private:
     struct ClientInfo {
+        PeerState peer; ///< сессия клиента и окно номеров
         std::chrono::steady_clock::time_point last_seen;
         sockaddr_in addr;
     };
@@ -66,7 +70,21 @@ class VPNServer {
     void udp_to_tun_loop();
     void cleanup_loop();
     void log_stats();
-    void touch_client(std::uint32_t tun_ip, const sockaddr_in& peer);
+
+    /**
+     * @brief Проверяет пакет клиента на повтор и обновляет его адрес; клиента создаёт только keep-alive.
+     * @param tun_ip адрес клиента в туннеле
+     * @param header заголовок пакета
+     * @param keep_alive_time_ns время из keep-alive; nullopt для данных
+     * @param from адрес, с которого пришёл пакет
+     * @return true - пакет принят
+     */
+    bool accept_from_client(std::uint32_t tun_ip, const PacketHeader& header, std::optional<std::int64_t> keep_alive_time_ns,
+                            const sockaddr_in& from);
+    /** @brief Отвечает клиенту своим keep-alive: так клиент узнаёт сессию сервера. */
+    void send_keep_alive(const sockaddr_in& to);
+    /** @brief Пишет в журнал причину отказа, не чаще раза в минуту для каждой причины. */
+    void log_rejected(PeerState::Verdict v, std::uint32_t tun_ip, const sockaddr_in& from, std::optional<std::int64_t> keep_alive_time_ns);
 
     std::unordered_map<std::uint32_t, ClientInfo> m_clients;
     std::unique_ptr<NatRules> m_nat;
@@ -81,11 +99,16 @@ class VPNServer {
     std::string m_external_iface;
 
     Crypto m_crypto;
+    TxSession m_tx;
+    LogThrottle m_skew_log{std::chrono::seconds(60)};
+    LogThrottle m_stale_log{std::chrono::seconds(60)};
+    LogThrottle m_old_protocol_log{std::chrono::seconds(60)};
     StopEvent m_stop;
     TunDevice m_tun;
 
     std::atomic<std::uint64_t> m_packets_to_clients{0};
     std::atomic<std::uint64_t> m_packets_from_clients{0};
+    std::atomic<std::uint64_t> m_rejected{0};
     std::uint64_t m_last_to = 0;
     std::uint64_t m_last_from = 0;
     std::size_t m_mtu;

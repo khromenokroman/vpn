@@ -19,6 +19,7 @@
 #include "share/log.hpp"
 #include "share/net.hpp"
 #include "share/packet.hpp"
+#include "share/replay.hpp"
 #include "share/signal_fd.hpp"
 
 namespace {
@@ -39,7 +40,12 @@ std::string endpoint_to_string(const sockaddr_in& addr) { return fmt::format("{}
 
 VPNServer::VPNServer(std::string_view tun_name, std::string_view tun_ip, std::string_view external_iface, std::uint16_t port, std::size_t mtu,
                      std::string_view key)
-    : m_tun_name(tun_name), m_tun_ip(tun_ip), m_external_iface(external_iface), m_crypto{key}, m_mtu{mtu}, m_port(port) {}
+    : m_tun_name(tun_name),
+      m_tun_ip(tun_ip),
+      m_external_iface(external_iface),
+      m_crypto{key, Direction::SERVER_TO_CLIENT},
+      m_mtu{mtu},
+      m_port(port) {}
 
 VPNServer::~VPNServer() { stop(); }
 
@@ -133,13 +139,14 @@ bool VPNServer::run(const SignalFd& signals) {
 void VPNServer::log_stats() {
     std::uint64_t to = m_packets_to_clients.load(std::memory_order_relaxed);
     std::uint64_t from = m_packets_from_clients.load(std::memory_order_relaxed);
+    std::uint64_t rejected = m_rejected.load(std::memory_order_relaxed);
     std::size_t clients;
     {
         std::lock_guard<std::mutex> lk(m_clients_mutex);
         clients = m_clients.size();
     }
-    log_msg(LOG_DEBUG, "Статистика: TUN->клиентам={} (+{}), клиенты->TUN={} (+{}), клиентов={}", to, to - m_last_to, from, from - m_last_from,
-            clients);
+    log_msg(LOG_DEBUG, "Статистика: TUN->клиентам={} (+{}), клиенты->TUN={} (+{}), отброшено повторов и чужих сессий={}, клиентов={}", to,
+            to - m_last_to, from, from - m_last_from, rejected, clients);
     m_last_to = to;
     m_last_from = from;
 }
@@ -193,7 +200,7 @@ void VPNServer::tun_to_udp_loop() {
         }
 
         std::size_t encrypted_size = 0;
-        if (!m_crypto.encrypt(plain_buffer.data(), static_cast<std::size_t>(n), encrypted_buffer.data(), encrypted_size)) {
+        if (!m_crypto.seal(m_tx.next(), plain_buffer.data(), static_cast<std::size_t>(n), encrypted_buffer.data(), encrypted_size)) {
             continue;
         }
 
@@ -232,13 +239,18 @@ void VPNServer::udp_to_tun_loop() {
         }
 
         std::size_t plain_size = 0;
-        if (!m_crypto.decrypt(encrypted_buffer.data(), static_cast<std::size_t>(n), plain_buffer.data(), plain_size)) {
-            continue;
+        PacketHeader header{};
+        Crypto::Open opened = m_crypto.open(encrypted_buffer.data(), static_cast<std::size_t>(n), plain_buffer.data(), plain_size, header);
+        if (opened == Crypto::Open::OLD_PROTOCOL && m_old_protocol_log.allow()) {
+            log_msg(LOG_WARNING, "Пакет старого формата (клиент до 0.5.0.0) с {}: обновите клиент", endpoint_to_string(peer));
         }
+        if (opened != Crypto::Open::OK) continue;
+
         if (is_control_packet(plain_buffer.data(), plain_size)) {
-            auto client_ip = parse_keep_alive(plain_buffer.data(), plain_size);
-            if (client_ip && *client_ip != m_tun_ip_be && same_subnet24(*client_ip, m_tun_ip_be)) {
-                touch_client(*client_ip, peer);
+            auto ka = parse_keep_alive(plain_buffer.data(), plain_size);
+            if (ka && ka->tun_ip != m_tun_ip_be && same_subnet24(ka->tun_ip, m_tun_ip_be) &&
+                accept_from_client(ka->tun_ip, header, ka->time_ns, peer)) {
+                send_keep_alive(peer);
             }
             continue;
         }
@@ -248,7 +260,7 @@ void VPNServer::udp_to_tun_loop() {
         if (!ip || ip->src == m_tun_ip_be || !same_subnet24(ip->src, m_tun_ip_be)) {
             continue;
         }
-        touch_client(ip->src, peer);
+        if (!accept_from_client(ip->src, header, std::nullopt, peer)) continue;
 
         ssize_t written = ::write(tun_fd, plain_buffer.data(), plain_size);
         if (written >= 0) {
@@ -261,18 +273,60 @@ void VPNServer::udp_to_tun_loop() {
     m_stop.notify();
 }
 
-void VPNServer::touch_client(std::uint32_t tun_ip, const sockaddr_in& peer) {
+bool VPNServer::accept_from_client(std::uint32_t tun_ip, const PacketHeader& header, std::optional<std::int64_t> keep_alive_time_ns,
+                                   const sockaddr_in& from) {
     std::lock_guard<std::mutex> lk(m_clients_mutex);
-    auto [it, inserted] = m_clients.try_emplace(tun_ip, ClientInfo{std::chrono::steady_clock::now(), peer});
-    if (inserted) {
-        log_msg(LOG_INFO, "Новый клиент: {} с {}", ipv4_to_string(tun_ip), endpoint_to_string(peer));
-        return;
+    auto it = m_clients.find(tun_ip);
+    const bool known = it != m_clients.end();
+    // нового клиента в таблицу не добавляем, пока его keep-alive не принят
+    PeerState fresh;
+    PeerState& state = known ? it->second.peer : fresh;
+    PeerState::Verdict v = state.check(header, keep_alive_time_ns, wall_clock_ns());
+    if (!PeerState::accepted(v)) {
+        m_rejected.fetch_add(1, std::memory_order_relaxed);
+        log_rejected(v, tun_ip, from, keep_alive_time_ns);
+        return false;
     }
-    if (it->second.addr.sin_addr.s_addr != peer.sin_addr.s_addr || it->second.addr.sin_port != peer.sin_port) {
-        log_msg(LOG_INFO, "Клиент {} сменил адрес: {} -> {}", ipv4_to_string(tun_ip), endpoint_to_string(it->second.addr), endpoint_to_string(peer));
-        it->second.addr = peer;
+
+    auto now = std::chrono::steady_clock::now();
+    if (!known) {
+        m_clients.emplace(tun_ip, ClientInfo{fresh, now, from});
+        log_msg(LOG_INFO, "Новый клиент: {} с {}", ipv4_to_string(tun_ip), endpoint_to_string(from));
+        return true;
     }
-    it->second.last_seen = std::chrono::steady_clock::now();
+    if (v == PeerState::Verdict::NEW_SESSION) {
+        log_msg(LOG_INFO, "Клиент {} переподключился с {}", ipv4_to_string(tun_ip), endpoint_to_string(from));
+    }
+    // адрес меняется только по принятому пакету: повтор перехваченного пакета не уведёт трафик клиента
+    ClientInfo& client = it->second;
+    if (client.addr.sin_addr.s_addr != from.sin_addr.s_addr || client.addr.sin_port != from.sin_port) {
+        log_msg(LOG_INFO, "Клиент {} сменил адрес: {} -> {}", ipv4_to_string(tun_ip), endpoint_to_string(client.addr), endpoint_to_string(from));
+        client.addr = from;
+    }
+    client.last_seen = now;
+    return true;
+}
+
+void VPNServer::log_rejected(PeerState::Verdict v, std::uint32_t tun_ip, const sockaddr_in& from, std::optional<std::int64_t> keep_alive_time_ns) {
+    if (v == PeerState::Verdict::CLOCK_SKEW && keep_alive_time_ns && m_skew_log.allow()) {
+        double skew = static_cast<double>(*keep_alive_time_ns - wall_clock_ns()) / 1e9;
+        log_msg(LOG_WARNING, "Keep-alive клиента {} с {} отклонён: часы клиента расходятся с сервером на {:+.0f} с, допустимо {} с; проверьте NTP",
+                ipv4_to_string(tun_ip), endpoint_to_string(from), skew, MAX_CLOCK_SKEW.count());
+    } else if (v == PeerState::Verdict::STALE_SESSION && m_stale_log.allow()) {
+        log_msg(LOG_WARNING, "Keep-alive клиента {} с {} отклонён: сессия начата раньше текущей (повтор старого пакета или часы клиента ушли назад)",
+                ipv4_to_string(tun_ip), endpoint_to_string(from));
+    }
+}
+
+void VPNServer::send_keep_alive(const sockaddr_in& to) {
+    auto plain = make_keep_alive(m_tun_ip_be, wall_clock_ns());
+    std::array<char, KEEP_ALIVE_SIZE + Crypto::overhead()> sealed;
+    std::size_t sealed_size = 0;
+    if (!m_crypto.seal(m_tx.next(), plain.data(), plain.size(), sealed.data(), sealed_size)) return;
+    if (::sendto(m_udp_fd, sealed.data(), sealed_size, 0, reinterpret_cast<const sockaddr*>(&to), sizeof(to)) < 0 && errno != EINTR &&
+        errno != EAGAIN) {
+        log_msg(LOG_WARNING, "Не удалось ответить keep-alive клиенту {}: {}", endpoint_to_string(to), errno_str(errno));
+    }
 }
 
 void VPNServer::cleanup_loop() {
